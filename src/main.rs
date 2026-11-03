@@ -77,6 +77,7 @@ fn main() {
 fn serve() -> std::io::Result<()> {
     let socket = Socket::bind("tinyline-0")?;
     println!("listening on {}", socket.path.display());
-    println!("try: WAYLAND_DISPLAY=tinyline-0 wayland-info");
-    run(&socket)
+    println!("try: WAYLAND_DISPLAY=tinyline-0 cargo run --example paint");
+    let output = Rect::new(0, 0, 800, 480);
+    run(&socket, output, std::path::Path::new("tinyline-frame.ppm"))
 }

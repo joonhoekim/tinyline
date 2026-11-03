@@ -101,7 +101,7 @@ fn print_events(bytes: &[u8]) -> Result<(), WireError> {
 
 pub fn protocol_demo() -> Result<(), WireError> {
     let mut client = Client::new(1);
-    let mut shared = Shared::new();
+    let mut shared = Shared::default();
 
     // 클라이언트가 보낸다고 치는 요청들: get_registry(2), sync(3), bind(1, wl_compositor, 4, id 4)
     let mut requests = MessageBuilder::new(1, 1).uint(2).finish();

@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use memmap2::{Mmap, MmapOptions};
 
+use crate::layout::{Desktop, Rect};
 use crate::wire::{Args, Header, MessageBuilder, WireError, split_message};
 
 /// 클라이언트가 만든 객체 하나의 종류.
@@ -297,17 +298,67 @@ impl ProtocolError {
 /// 모든 클라이언트가 함께 쓰는 컴포지터 쪽 상태.
 pub struct Shared {
     next_serial: u32,
+    /// 화면과 그 위의 창들(1부에서 만든 그것).
+    pub desktop: Desktop,
+    /// 창 id → 그 창에 그림을 대는 (클라이언트, 표면).
+    pub windows: HashMap<u32, (u32, u32)>,
+    /// 지난번에 그린 뒤로 바뀐 것이 있다.
+    pub dirty: bool,
 }
 
 impl Default for Shared {
     fn default() -> Shared {
-        Shared::new()
+        Shared::new(Rect::new(0, 0, 800, 480))
     }
 }
 
 impl Shared {
-    pub fn new() -> Shared {
-        Shared { next_serial: 1 }
+    pub fn new(output: Rect) -> Shared {
+        Shared {
+            next_serial: 1,
+            desktop: Desktop::new(output),
+            windows: HashMap::new(),
+            dirty: false,
+        }
+    }
+
+    fn window_for(&self, client: u32, surface: u32) -> Option<u32> {
+        self.windows
+            .iter()
+            .find(|(_, owner)| **owner == (client, surface))
+            .map(|(window, _)| *window)
+    }
+
+    /// 표면에 창이 없으면 하나 연다.
+    fn show(&mut self, client: u32, surface: u32) {
+        if self.window_for(client, surface).is_none() {
+            let window = self
+                .desktop
+                .open(&format!("client {client} surface {surface}"));
+            self.windows.insert(window, (client, surface));
+        }
+    }
+
+    /// 표면의 창을 닫는다.
+    fn hide(&mut self, client: u32, surface: u32) {
+        if let Some(window) = self.window_for(client, surface) {
+            self.desktop.close(window);
+            self.windows.remove(&window);
+            self.dirty = true;
+        }
+    }
+
+    /// 연결이 끊긴 클라이언트의 창을 모두 닫는다.
+    pub fn forget_client(&mut self, client: u32) {
+        let surfaces: Vec<u32> = self
+            .windows
+            .values()
+            .filter(|(owner, _)| *owner == client)
+            .map(|(_, surface)| *surface)
+            .collect();
+        for surface in surfaces {
+            self.hide(client, surface);
+        }
     }
 
     /// 컴포지터 전체에서 하나씩 늘어나는 번호. 어느 클라이언트에 주든 겹치지 않는다.
@@ -536,7 +587,9 @@ impl Client {
             }
             (Object::Region, 0) => self.destroy(header.object),
             (Object::Region, 1 | 2) => {}
-            (Object::Surface, opcode) => self.handle_surface(header.object, opcode, args)?,
+            (Object::Surface, opcode) => {
+                self.handle_surface(header.object, opcode, args, shared)?;
+            }
             _ => {
                 return Err(ProtocolError::InvalidMethod {
                     object: header.object,
@@ -552,11 +605,13 @@ impl Client {
         id: u32,
         opcode: u16,
         mut args: Args<'_>,
+        shared: &mut Shared,
     ) -> Result<(), ProtocolError> {
         match opcode {
             // destroy
             0 => {
                 self.surfaces.remove(&id);
+                shared.hide(self.id, id);
                 self.destroy(id);
             }
             // attach(buffer, x, y): 0번 객체는 "버퍼 없음"
@@ -584,13 +639,13 @@ impl Client {
             // set_opaque_region, set_input_region, set_buffer_transform, set_buffer_scale: 무시한다
             4 | 5 | 7 | 8 => {}
             // commit: 모아 둔 변경을 한꺼번에 적용한다
-            6 => self.commit(id),
+            6 => self.commit(id, shared),
             _ => return Err(ProtocolError::InvalidMethod { object: id, opcode }),
         }
         Ok(())
     }
 
-    fn commit(&mut self, id: u32) {
+    fn commit(&mut self, id: u32, shared: &mut Shared) {
         let surface = self.surfaces.get_mut(&id).expect("surface exists");
         let pending = std::mem::take(&mut surface.pending);
         let mut released = None;
@@ -606,6 +661,12 @@ impl Client {
         }
         surface.frame_callbacks.extend(pending.frame_callbacks);
         surface.commits += 1;
+        if surface.image.is_some() {
+            shared.show(self.id, id);
+        } else {
+            shared.hide(self.id, id);
+        }
+        shared.dirty = true;
         if self.log {
             let size = surface
                 .image
@@ -674,7 +735,7 @@ mod tests {
     fn sync_is_answered_and_its_id_released() {
         let mut client = Client::new(1);
         let sync = MessageBuilder::new(1, 0).uint(5).finish();
-        assert_eq!(client.receive(&sync, &mut Shared::new()), Ok(12));
+        assert_eq!(client.receive(&sync, &mut Shared::default()), Ok(12));
         let events = events(&mut client);
         assert_eq!(events.len(), 2);
         assert_eq!((events[0].0.object, events[0].0.opcode), (5, 0)); // callback.done
@@ -689,7 +750,7 @@ mod tests {
         client
             .receive(
                 &MessageBuilder::new(1, 1).uint(2).finish(),
-                &mut Shared::new(),
+                &mut Shared::default(),
             )
             .unwrap();
         let events = events(&mut client);
@@ -700,7 +761,7 @@ mod tests {
             .uint(4)
             .uint(3)
             .finish();
-        client.receive(&bind, &mut Shared::new()).unwrap();
+        client.receive(&bind, &mut Shared::default()).unwrap();
         assert_eq!(client.objects.get(&3), Some(&Object::Compositor));
     }
 
@@ -709,7 +770,7 @@ mod tests {
         let mut client = Client::new(1);
         let mut bytes = MessageBuilder::new(1, 0).uint(5).finish();
         bytes.extend_from_slice(&MessageBuilder::new(1, 0).uint(6).finish()[..4]);
-        assert_eq!(client.receive(&bytes, &mut Shared::new()), Ok(12));
+        assert_eq!(client.receive(&bytes, &mut Shared::default()), Ok(12));
     }
 
     /// 크기가 `size`인 메모리 파일을 만들어, 앞 4바이트에 `first`를 쓴다.
@@ -740,7 +801,7 @@ mod tests {
 
     #[test]
     fn shm_buffer_reads_client_memory() {
-        let mut shared = Shared::new();
+        let mut shared = Shared::default();
         let mut client = client_with_shm(&mut shared);
         client.fds.push_back(memfd(16 * 16 * 4, 0xff112233));
         let mut bytes = MessageBuilder::new(3, 0).uint(4).int(16 * 16 * 4).finish();
@@ -761,7 +822,7 @@ mod tests {
 
     #[test]
     fn shm_rejects_missing_fd_and_oversized_buffers() {
-        let mut shared = Shared::new();
+        let mut shared = Shared::default();
         let mut client = client_with_shm(&mut shared);
         let create_pool = MessageBuilder::new(3, 0).uint(4).int(64).finish();
         assert_eq!(
@@ -797,7 +858,7 @@ mod tests {
 
     #[test]
     fn surface_changes_wait_for_commit() {
-        let mut shared = Shared::new();
+        let mut shared = Shared::default();
         let mut client = client_with_shm(&mut shared);
         client.fds.push_back(memfd(16, 0x00abcdef));
         let mut bytes = MessageBuilder::new(3, 0).uint(4).int(16).finish();
@@ -843,18 +904,18 @@ mod tests {
     fn protocol_errors() {
         let mut client = Client::new(1);
         assert_eq!(
-            client.receive(&MessageBuilder::new(9, 0).finish(), &mut Shared::new()),
+            client.receive(&MessageBuilder::new(9, 0).finish(), &mut Shared::default()),
             Err(ProtocolError::UnknownObject(9))
         );
         assert_eq!(
             client.receive(
                 &MessageBuilder::new(1, 1).uint(1).finish(),
-                &mut Shared::new()
+                &mut Shared::default()
             ),
             Err(ProtocolError::IdInUse(1))
         );
         assert_eq!(
-            client.receive(&MessageBuilder::new(1, 7).finish(), &mut Shared::new()),
+            client.receive(&MessageBuilder::new(1, 7).finish(), &mut Shared::default()),
             Err(ProtocolError::InvalidMethod {
                 object: 1,
                 opcode: 7

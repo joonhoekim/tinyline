@@ -99,6 +99,20 @@ impl Desktop {
         }
     }
 
+    /// 창들이 놓이는 화면.
+    pub fn output(&self) -> Rect {
+        self.output
+    }
+
+    /// 열린 창들. 고치려면 `open`·`close`·`focus`를 거쳐야 한다.
+    pub fn windows(&self) -> &[Window] {
+        &self.windows
+    }
+
+    pub fn focused(&self) -> Option<u32> {
+        self.focused
+    }
+
     /// 새 창을 열고 그 id를 돌려준다. 창을 열 때마다 화면을 다시 나누고,
     /// 새 창에 포커스를 준다.
     pub fn open(&mut self, title: &str) -> u32 {

@@ -4,14 +4,16 @@ use std::fs;
 use std::io::{self, IoSliceMut, Write};
 use std::mem::MaybeUninit;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
 
+use crate::layout::Rect;
 use crate::protocol::{Client, Shared};
+use crate::render::Frame;
 
 /// `$XDG_RUNTIME_DIR` 안에 만든 소켓 파일. 이 값이 사라질 때 파일도 지운다.
 pub struct Socket {
@@ -53,7 +55,7 @@ impl Connection {
     /// 읽을 것이 있다고 poll이 알려 준 연결에서 한 번 읽고, 처리하고, 답을 보낸다.
     ///
     /// 바이트와 함께 파일 디스크립터가 올 수 있으므로 `read` 대신 `recvmsg`로 읽는다.
-    fn on_readable(&mut self, shared: &mut Shared, started: Instant) -> io::Result<()> {
+    fn on_readable(&mut self, shared: &mut Shared) -> io::Result<()> {
         let mut chunk = [0u8; 4096];
         // 메시지 한 번에 fd가 최대 28개까지 올 수 있다(libwayland가 한 번에 보내는 최대치).
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(28))];
@@ -84,9 +86,6 @@ impl Connection {
         match self.client.receive(&self.pending, shared) {
             Ok(used) => {
                 self.pending.drain(..used);
-                // 아직 화면에 그리지는 않는다. "다 그렸다"는 답만 바로 보낸다.
-                let time_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
-                self.client.frame_done(time_ms);
             }
             Err(error) => {
                 println!("[{}] protocol error: {error}", self.client.id);
@@ -94,16 +93,48 @@ impl Connection {
                 self.closed = true;
             }
         }
+        self.flush()
+    }
+
+    /// 쌓인 이벤트를 소켓으로 보낸다.
+    fn flush(&mut self) -> io::Result<()> {
         self.stream.write_all(&self.client.outgoing)?;
         self.client.outgoing.clear();
         Ok(())
     }
 }
 
+const BACKGROUND: u32 = 0xff_2e_34_40;
+const FOCUS_BORDER: u32 = 0xff_88_c0_d0;
+
+/// 창마다 그 표면의 그림을 찾아 출력 한 장으로 합친다.
+fn composite(shared: &Shared, connections: &[Connection]) -> Frame {
+    let output = shared.desktop.output();
+    let mut frame = Frame::new(output.width, output.height, BACKGROUND);
+    for window in shared.desktop.windows() {
+        let Some((client_id, surface_id)) = shared.windows.get(&window.id) else {
+            continue;
+        };
+        let image = connections
+            .iter()
+            .find(|connection| connection.client.id == *client_id)
+            .and_then(|connection| connection.client.surfaces.get(surface_id))
+            .and_then(|surface| surface.image.as_ref());
+        if let Some(image) = image {
+            frame.draw(image, window.rect);
+        }
+        if shared.desktop.focused() == Some(window.id) {
+            frame.outline(window.rect, 2, FOCUS_BORDER);
+        }
+    }
+    frame
+}
+
 /// 소켓 하나와 연결된 클라이언트들을 돌보는 이벤트 루프. 돌아오지 않는다.
-pub fn run(socket: &Socket) -> io::Result<()> {
+pub fn run(socket: &Socket, output: Rect, frame_path: &Path) -> io::Result<()> {
     socket.listener.set_nonblocking(true)?;
-    let mut shared = Shared::new();
+    let mut shared = Shared::new(output);
+    let mut frames = 0;
     let mut connections: Vec<Connection> = Vec::new();
     let mut next_id = 1;
     let started = Instant::now();
@@ -147,13 +178,38 @@ pub fn run(socket: &Socket) -> io::Result<()> {
 
         // 4. 읽을 것이 있는 연결을 처리한다. 방금 받은 연결은 `ready`에 칸이 없다.
         for (connection, is_ready) in connections.iter_mut().zip(&ready[1..]) {
-            if *is_ready && let Err(error) = connection.on_readable(&mut shared, started) {
+            if *is_ready && let Err(error) = connection.on_readable(&mut shared) {
                 println!("[{}] i/o error: {error}", connection.client.id);
                 connection.closed = true;
             }
         }
 
-        // 5. 끝난 연결을 치운다. 연결이 사라지면 소켓도 닫힌다.
+        // 5. 끝난 연결을 치운다. 그 클라이언트의 창도 닫는다. 연결이 사라지면 소켓도 닫힌다.
+        for connection in &connections {
+            if connection.closed {
+                shared.forget_client(connection.client.id);
+            }
+        }
         connections.retain(|connection| !connection.closed);
+
+        // 6. 바뀐 것이 있으면 다시 그리고, 그렸다고 클라이언트들에게 알린다.
+        if shared.dirty {
+            shared.dirty = false;
+            let frame = composite(&shared, &connections);
+            frame.save_ppm(frame_path)?;
+            frames += 1;
+            println!(
+                "frame {frames}: {} window(s) -> {}",
+                shared.desktop.windows().len(),
+                frame_path.display()
+            );
+            let time_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            for connection in &mut connections {
+                connection.client.frame_done(time_ms);
+                if connection.flush().is_err() {
+                    connection.closed = true;
+                }
+            }
+        }
     }
 }

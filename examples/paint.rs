@@ -1,8 +1,9 @@
 //! 시험용 Wayland 클라이언트. 컴포지터에 붙어 공유 메모리에 그림을 그려 넘긴다.
 //!
 //! ```sh
-//! cargo run -- serve                 # 터미널 1
-//! WAYLAND_DISPLAY=tinyline-0 cargo run --example paint   # 터미널 2
+//! cargo run -- serve                                          # 터미널 1
+//! WAYLAND_DISPLAY=tinyline-0 cargo run --example paint        # 터미널 2
+//! WAYLAND_DISPLAY=tinyline-0 cargo run --example paint -- 5 2e8b57   # 5초 동안, 초록으로
 //! ```
 
 use std::io::{self, IoSlice, Read, Write};
@@ -14,8 +15,8 @@ use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
 use tinyline::wire::{Args, MessageBuilder, WireError, split_message};
 
-const WIDTH: u32 = 64;
-const HEIGHT: u32 = 64;
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 240;
 
 /// 컴포지터와의 연결. 이벤트를 받아 그대로 쌓아 둔다.
 struct Connection {
@@ -110,15 +111,23 @@ fn wire(error: WireError) -> io::Error {
 }
 
 /// 바둑판 무늬. 픽셀 하나는 0xAARRGGBB(작은 쪽 바이트부터 메모리에 놓인다).
-fn checkerboard(x: u32, y: u32) -> u32 {
-    if (x / 8 + y / 8).is_multiple_of(2) {
-        0xff_ff_88_00 // 주황
+fn checkerboard(x: u32, y: u32, color: u32) -> u32 {
+    if (x / 16 + y / 16).is_multiple_of(2) {
+        0xff00_0000 | color
     } else {
         0xff_20_20_40 // 짙은 남색
     }
 }
 
 fn main() -> io::Result<()> {
+    // 인자: [머무를 초] [색 RRGGBB]
+    let mut args = std::env::args().skip(1);
+    let seconds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let color = args
+        .next()
+        .and_then(|s| u32::from_str_radix(&s, 16).ok())
+        .unwrap_or(0xff_88_00);
+
     let mut conn = Connection::connect()?;
 
     // 1. 어떤 전역 객체가 있는지 묻는다.
@@ -165,7 +174,7 @@ fn main() -> io::Result<()> {
     let mut pixels = Vec::with_capacity(size as usize);
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
-            pixels.extend_from_slice(&checkerboard(x, y).to_le_bytes());
+            pixels.extend_from_slice(&checkerboard(x, y, color).to_le_bytes());
         }
     }
     file.write_all(&pixels)?;
@@ -231,5 +240,7 @@ fn main() -> io::Result<()> {
             println!("frame#{frame} done at {} ms", args.uint().expect("time"));
         }
     })?;
+    // 창이 화면에 남아 있게 잠시 연결을 붙들고 있는다.
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
     Ok(())
 }
