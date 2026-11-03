@@ -208,6 +208,179 @@ impl Desktop {
     }
 }
 
+/// Wayland 메시지의 머리. 모든 메시지는 이 8바이트로 시작한다.
+///
+/// - 첫 4바이트: 이 메시지를 보낸(또는 받을) 객체의 id
+/// - 다음 4바이트: 위 16비트는 머리를 포함한 메시지 전체 길이, 아래 16비트는 opcode
+///
+/// 숫자는 모두 이 기계의 바이트 순서(native endian)로 쓴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Header {
+    object: u32,
+    opcode: u16,
+    size: u16,
+}
+
+const HEADER_SIZE: usize = 8;
+
+/// 바이트 앞부분에서 머리를 읽는다. 8바이트가 안 되면 `None`.
+fn read_header(bytes: &[u8]) -> Option<Header> {
+    let object = u32::from_ne_bytes(bytes.get(0..4)?.try_into().ok()?);
+    let word = u32::from_ne_bytes(bytes.get(4..8)?.try_into().ok()?);
+    Some(Header {
+        object,
+        opcode: (word & 0xffff) as u16,
+        size: (word >> 16) as u16,
+    })
+}
+
+/// 메시지 하나를 바이트로 조립한다. 인자를 순서대로 붙인 뒤 `finish`로 머리를 씌운다.
+struct MessageBuilder {
+    object: u32,
+    opcode: u16,
+    args: Vec<u8>,
+}
+
+impl MessageBuilder {
+    fn new(object: u32, opcode: u16) -> MessageBuilder {
+        MessageBuilder {
+            object,
+            opcode,
+            args: Vec::new(),
+        }
+    }
+
+    fn uint(mut self, value: u32) -> MessageBuilder {
+        self.args.extend_from_slice(&value.to_ne_bytes());
+        self
+    }
+
+    fn int(mut self, value: i32) -> MessageBuilder {
+        self.args.extend_from_slice(&value.to_ne_bytes());
+        self
+    }
+
+    /// 문자열: 길이(끝의 0 바이트 포함) → 글자 → 0 바이트 → 4의 배수가 되도록 0으로 채움.
+    fn string(mut self, value: &str) -> MessageBuilder {
+        let length = u32::try_from(value.len() + 1).expect("string length fits in u32");
+        self = self.uint(length);
+        self.args.extend_from_slice(value.as_bytes());
+        self.args.push(0);
+        while !self.args.len().is_multiple_of(4) {
+            self.args.push(0);
+        }
+        self
+    }
+
+    fn finish(self) -> Vec<u8> {
+        let size = HEADER_SIZE + self.args.len();
+        let size = u32::try_from(size).expect("message size fits in u32");
+        let word = (size << 16) | u32::from(self.opcode);
+        let mut bytes = Vec::with_capacity(HEADER_SIZE + self.args.len());
+        bytes.extend_from_slice(&self.object.to_ne_bytes());
+        bytes.extend_from_slice(&word.to_ne_bytes());
+        bytes.extend_from_slice(&self.args);
+        bytes
+    }
+}
+
+/// 메시지의 인자 부분을 앞에서부터 하나씩 읽는다.
+///
+/// 읽는 동안 원래 바이트를 빌려 들고 있으므로, 그 바이트가 얼마나 살아 있는지를
+/// 타입에 `'a`로 적는다.
+struct Args<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Args<'a> {
+    fn new(bytes: &'a [u8]) -> Args<'a> {
+        Args { bytes, position: 0 }
+    }
+
+    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+        let end = self.position.checked_add(count)?;
+        let chunk = self.bytes.get(self.position..end)?;
+        self.position = end;
+        Some(chunk)
+    }
+
+    fn uint(&mut self) -> Option<u32> {
+        Some(u32::from_ne_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn int(&mut self) -> Option<i32> {
+        Some(i32::from_ne_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn string(&mut self) -> Option<&'a str> {
+        let length = usize::try_from(self.uint()?).ok()?;
+        let padded = length.checked_add(3)? / 4 * 4;
+        let chunk = self.take(padded)?;
+        let (text, terminator) = chunk.get(..length)?.split_at(length.checked_sub(1)?);
+        if terminator != [0] {
+            return None;
+        }
+        std::str::from_utf8(text).ok()
+    }
+}
+
+/// 바이트를 4개씩 끊어 16진수로 보여 준다.
+fn hex(bytes: &[u8]) -> String {
+    let words: Vec<String> = bytes
+        .chunks(4)
+        .map(|word| word.iter().map(|b| format!("{b:02x}")).collect())
+        .collect();
+    words.join(" ")
+}
+
+fn wire_demo() {
+    // 클라이언트가 접속하자마자 보내는 두 요청
+    // wl_display(객체 1).get_registry(새 객체 2)  — opcode 1
+    // wl_display(객체 1).sync(새 객체 3)          — opcode 0
+    let get_registry = MessageBuilder::new(1, 1).uint(2).finish();
+    let sync = MessageBuilder::new(1, 0).uint(3).finish();
+    println!("get_registry: {}", hex(&get_registry));
+    println!("sync:         {}", hex(&sync));
+
+    // 두 메시지가 이어 붙어 소켓으로 온다고 치고, 앞에서부터 잘라 읽는다.
+    let mut stream = get_registry.clone();
+    stream.extend_from_slice(&sync);
+    let mut rest = stream.as_slice();
+    while let Some(header) = read_header(rest) {
+        let size = usize::from(header.size);
+        let mut args = Args::new(&rest[HEADER_SIZE..size]);
+        println!("{header:?} new_id={:?}", args.uint());
+        rest = &rest[size..];
+    }
+
+    // 컴포지터가 보내는 이벤트: wl_registry(객체 2).global(이름 1, "wl_compositor", 버전 6)
+    let global = MessageBuilder::new(2, 0)
+        .uint(1)
+        .string("wl_compositor")
+        .uint(6)
+        .finish();
+    println!("global:       {}", hex(&global));
+    let header = read_header(&global).expect("we just built it");
+    let mut args = Args::new(&global[HEADER_SIZE..]);
+    println!(
+        "{header:?} name={:?} interface={:?} version={:?}",
+        args.uint(),
+        args.string(),
+        args.uint()
+    );
+
+    // 음수 좌표도 같은 4바이트에 담긴다
+    let attach = MessageBuilder::new(5, 1).uint(0).int(-20).int(10).finish();
+    let mut args = Args::new(&attach[HEADER_SIZE..]);
+    println!(
+        "attach args: buffer={:?} x={:?} y={:?}",
+        args.uint(),
+        args.int(),
+        args.int()
+    );
+}
+
 /// 사용자가 입력한 명령 한 줄.
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -253,6 +426,13 @@ const HELP: &str =
     "commands: open <title> | close <id> | focus <id> | next | click <x> <y> | list | help | quit";
 
 fn main() {
+    // `cargo run -- wire`로 실행하면 메시지 형식을 보여 주고 끝난다.
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    if mode == "wire" {
+        wire_demo();
+        return;
+    }
+
     let mut desktop = Desktop::new(Rect::new(0, 0, 1920, 1080));
     println!("{HELP}");
 
@@ -386,6 +566,41 @@ mod tests {
         assert_eq!(desktop.focused, Some(a));
         desktop.focus_next();
         assert_eq!(desktop.focused, Some(b));
+    }
+
+    #[test]
+    fn header_round_trip() {
+        let bytes = MessageBuilder::new(7, 3).uint(42).finish();
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(
+            read_header(&bytes),
+            Some(Header {
+                object: 7,
+                opcode: 3,
+                size: 12
+            })
+        );
+        assert_eq!(read_header(&bytes[..7]), None);
+    }
+
+    #[test]
+    fn strings_are_padded_to_four_bytes() {
+        for text in ["", "a", "abc", "abcd", "wl_compositor"] {
+            let bytes = MessageBuilder::new(1, 0).string(text).uint(99).finish();
+            assert_eq!(bytes.len() % 4, 0);
+            let mut args = Args::new(&bytes[HEADER_SIZE..]);
+            assert_eq!(args.string(), Some(text));
+            assert_eq!(args.uint(), Some(99));
+        }
+    }
+
+    #[test]
+    fn reading_past_the_end_fails() {
+        let bytes = MessageBuilder::new(1, 0).uint(1).finish();
+        let mut args = Args::new(&bytes[HEADER_SIZE..]);
+        assert_eq!(args.uint(), Some(1));
+        assert_eq!(args.uint(), None);
+        assert_eq!(args.int(), None);
     }
 
     #[test]
