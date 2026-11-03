@@ -46,29 +46,94 @@ impl Rect {
     }
 }
 
+/// 컴포지터가 관리하는 창 하나.
+#[derive(Debug)]
+struct Window {
+    id: u32,
+    title: String,
+    rect: Rect,
+}
+
+/// 화면 하나와 그 위의 창들.
+struct Desktop {
+    output: Rect,
+    windows: Vec<Window>,
+    next_id: u32,
+}
+
+impl Desktop {
+    fn new(output: Rect) -> Desktop {
+        Desktop {
+            output,
+            windows: Vec::new(),
+            next_id: 1,
+        }
+    }
+
+    /// 새 창을 열고 그 id를 돌려준다. 새 창은 화면 전체를 차지한다.
+    fn open(&mut self, title: &str) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.windows.push(Window {
+            id,
+            title: title.to_string(),
+            rect: self.output,
+        });
+        id
+    }
+
+    /// id에 해당하는 창을 닫는다. 그런 창이 없었으면 false.
+    fn close(&mut self, id: u32) -> bool {
+        let before = self.windows.len();
+        self.windows.retain(|w| w.id != id);
+        self.windows.len() != before
+    }
+
+    /// 서로 겹치는 창의 쌍이 몇 개인지 센다.
+    fn overlapping_pairs(&self) -> usize {
+        let mut count = 0;
+        for i in 0..self.windows.len() {
+            for j in (i + 1)..self.windows.len() {
+                if self.windows[i].rect.intersects(&self.windows[j].rect) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn print(&self) {
+        println!("{} window(s):", self.windows.len());
+        for window in &self.windows {
+            println!(
+                "  #{} {:?} at {:?} ({} px)",
+                window.id,
+                window.title,
+                window.rect,
+                window.rect.area()
+            );
+        }
+    }
+}
+
 fn main() {
-    let output = Rect::new(0, 0, 1920, 1080);
-    println!("output: {output:?}");
-    println!("output area: {} pixels", output.area());
+    let mut desktop = Desktop::new(Rect::new(0, 0, 1920, 1080));
 
-    let terminal = Rect::new(100, 100, 800, 600);
-    let browser = Rect::new(600, 400, 1000, 700);
-    let offscreen = Rect::new(-500, 50, 300, 200);
+    let terminal = desktop.open("terminal");
+    desktop.open("browser");
+    desktop.open("editor");
+    desktop.print();
+    println!("overlapping pairs: {}", desktop.overlapping_pairs());
 
-    println!(
-        "terminal and browser overlap: {}",
-        terminal.intersects(&browser)
-    );
-    println!("offscreen on output: {}", offscreen.intersects(&output));
-    println!(
-        "click (650, 450) hits terminal: {}",
-        terminal.contains(650, 450)
-    );
-    println!(
-        "click (650, 450) hits browser: {}",
-        browser.contains(650, 450)
-    );
+    // 클릭한 곳에 있는 창 찾기: 나중에 연 창이 위에 있으므로 뒤에서부터 본다.
+    for window in desktop.windows.iter().rev() {
+        if window.rect.contains(10, 10) {
+            println!("click (10, 10) hits #{} {:?}", window.id, window.title);
+            break;
+        }
+    }
 
-    let copy = terminal;
-    println!("copy == terminal: {}", copy == terminal);
+    println!("close #{terminal}: {}", desktop.close(terminal));
+    println!("close #{terminal} again: {}", desktop.close(terminal));
+    desktop.print();
 }
