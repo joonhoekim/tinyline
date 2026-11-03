@@ -299,3 +299,110 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spans_cover_total_without_gaps() {
+        for total in [0, 1, 7, 1000, 1920] {
+            for count in 1..=7 {
+                let mut next_start = 0;
+                for index in 0..count {
+                    let (start, length) = span(total, count, index);
+                    assert_eq!(
+                        start, next_start,
+                        "total={total} count={count} index={index}"
+                    );
+                    next_start = start + length;
+                }
+                assert_eq!(next_start, total, "total={total} count={count}");
+            }
+        }
+    }
+
+    #[test]
+    fn tiles_do_not_overlap() {
+        let area = Rect::new(-100, 20, 1000, 500);
+        let rects = tile(area, 3);
+        assert_eq!(rects.len(), 3);
+        assert_eq!(rects[0], Rect::new(-100, 20, 334, 500));
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                assert!(
+                    !rects[i].intersects(&rects[j]),
+                    "{:?} and {:?}",
+                    rects[i],
+                    rects[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rect_edges_are_exclusive() {
+        let r = Rect::new(0, 0, 10, 10);
+        assert!(r.contains(0, 0));
+        assert!(r.contains(9, 9));
+        assert!(!r.contains(10, 0));
+        assert!(!r.intersects(&Rect::new(10, 0, 5, 5)));
+    }
+
+    #[test]
+    fn new_window_takes_focus() {
+        let mut desktop = Desktop::new(Rect::new(0, 0, 100, 100));
+        assert_eq!(desktop.focused, None);
+        let a = desktop.open("a");
+        let b = desktop.open("b");
+        assert_eq!(desktop.focused, Some(b));
+        assert!(desktop.focus(a));
+        assert!(!desktop.focus(99));
+        assert_eq!(desktop.focused, Some(a));
+    }
+
+    #[test]
+    fn closing_focused_window_moves_focus() {
+        let mut desktop = Desktop::new(Rect::new(0, 0, 100, 100));
+        let a = desktop.open("a");
+        let b = desktop.open("b");
+        let c = desktop.open("c");
+        desktop.focus(b);
+        assert!(desktop.close(b));
+        assert_eq!(desktop.focused, Some(c), "the window that took b's place");
+        assert!(desktop.close(c));
+        assert_eq!(desktop.focused, Some(a), "the last window");
+        assert!(desktop.close(a));
+        assert_eq!(desktop.focused, None);
+        assert!(!desktop.close(a));
+    }
+
+    #[test]
+    fn focus_next_wraps_around() {
+        let mut desktop = Desktop::new(Rect::new(0, 0, 100, 100));
+        let a = desktop.open("a");
+        let b = desktop.open("b");
+        desktop.focus_next();
+        assert_eq!(desktop.focused, Some(a));
+        desktop.focus_next();
+        assert_eq!(desktop.focused, Some(b));
+    }
+
+    #[test]
+    fn parses_commands() {
+        assert_eq!(
+            parse_command("open web browser"),
+            Some(Command::Open("web browser".to_string()))
+        );
+        assert_eq!(parse_command("close 3"), Some(Command::Close(3)));
+        assert_eq!(
+            parse_command("click -5 10"),
+            Some(Command::Click { x: -5, y: 10 })
+        );
+        assert_eq!(parse_command("exit"), Some(Command::Quit));
+        assert_eq!(parse_command("open"), None);
+        assert_eq!(parse_command("close x"), None);
+        assert_eq!(parse_command("click 1"), None);
+        assert_eq!(parse_command("fly"), None);
+    }
+}
