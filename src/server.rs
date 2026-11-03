@@ -5,6 +5,7 @@ use std::io::{self, IoSliceMut, Write};
 use std::mem::MaybeUninit;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
@@ -52,7 +53,7 @@ impl Connection {
     /// 읽을 것이 있다고 poll이 알려 준 연결에서 한 번 읽고, 처리하고, 답을 보낸다.
     ///
     /// 바이트와 함께 파일 디스크립터가 올 수 있으므로 `read` 대신 `recvmsg`로 읽는다.
-    fn on_readable(&mut self, shared: &mut Shared) -> io::Result<()> {
+    fn on_readable(&mut self, shared: &mut Shared, started: Instant) -> io::Result<()> {
         let mut chunk = [0u8; 4096];
         // 메시지 한 번에 fd가 최대 28개까지 올 수 있다(libwayland가 한 번에 보내는 최대치).
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(28))];
@@ -83,6 +84,9 @@ impl Connection {
         match self.client.receive(&self.pending, shared) {
             Ok(used) => {
                 self.pending.drain(..used);
+                // 아직 화면에 그리지는 않는다. "다 그렸다"는 답만 바로 보낸다.
+                let time_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+                self.client.frame_done(time_ms);
             }
             Err(error) => {
                 println!("[{}] protocol error: {error}", self.client.id);
@@ -102,6 +106,7 @@ pub fn run(socket: &Socket) -> io::Result<()> {
     let mut shared = Shared::new();
     let mut connections: Vec<Connection> = Vec::new();
     let mut next_id = 1;
+    let started = Instant::now();
 
     loop {
         // 1. 무엇이 준비됐는지 묻는다. 첫 칸은 새 접속, 나머지는 연결마다 하나씩.
@@ -142,7 +147,7 @@ pub fn run(socket: &Socket) -> io::Result<()> {
 
         // 4. 읽을 것이 있는 연결을 처리한다. 방금 받은 연결은 `ready`에 칸이 없다.
         for (connection, is_ready) in connections.iter_mut().zip(&ready[1..]) {
-            if *is_ready && let Err(error) = connection.on_readable(&mut shared) {
+            if *is_ready && let Err(error) = connection.on_readable(&mut shared, started) {
                 println!("[{}] i/o error: {error}", connection.client.id);
                 connection.closed = true;
             }

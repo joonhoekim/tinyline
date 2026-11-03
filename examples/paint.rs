@@ -188,7 +188,48 @@ fn main() -> io::Result<()> {
             .uint(1) // xrgb8888
             .finish(),
     )?;
-    conn.roundtrip(|_, _, _| {})?;
     println!("buffer#{buffer}: {WIDTH}x{HEIGHT} in pool#{pool}");
+
+    // 5. 표면을 만들고, 버퍼를 붙이고, 다 됐으면 알려 달라(frame)고 한 뒤 commit한다.
+    let (compositor_name, _, _) = globals
+        .iter()
+        .find(|(_, interface, _)| interface == "wl_compositor")
+        .expect("compositor has wl_compositor");
+    let compositor = conn.new_id();
+    conn.send(
+        MessageBuilder::new(registry, 0)
+            .uint(*compositor_name)
+            .string("wl_compositor")
+            .uint(4)
+            .uint(compositor)
+            .finish(),
+    )?;
+    let surface = conn.new_id();
+    conn.send(MessageBuilder::new(compositor, 0).uint(surface).finish())?;
+    conn.send(
+        MessageBuilder::new(surface, 1)
+            .uint(buffer)
+            .int(0)
+            .int(0)
+            .finish(),
+    )?;
+    conn.send(
+        MessageBuilder::new(surface, 2)
+            .int(0)
+            .int(0)
+            .int(WIDTH as i32)
+            .int(HEIGHT as i32)
+            .finish(),
+    )?;
+    let frame = conn.new_id();
+    conn.send(MessageBuilder::new(surface, 3).uint(frame).finish())?;
+    conn.send(MessageBuilder::new(surface, 6).finish())?;
+    conn.roundtrip(|object, opcode, mut args| {
+        if object == buffer && opcode == 0 {
+            println!("buffer#{buffer} released: we may draw into it again");
+        } else if object == frame && opcode == 0 {
+            println!("frame#{frame} done at {} ms", args.uint().expect("time"));
+        }
+    })?;
     Ok(())
 }

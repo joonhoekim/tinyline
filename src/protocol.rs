@@ -23,6 +23,8 @@ pub enum Object {
     Shm,
     ShmPool,
     Buffer,
+    Surface,
+    Region,
 }
 
 impl Object {
@@ -35,6 +37,8 @@ impl Object {
             Object::Shm => "wl_shm",
             Object::ShmPool => "wl_shm_pool",
             Object::Buffer => "wl_buffer",
+            Object::Surface => "wl_surface",
+            Object::Region => "wl_region",
         }
     }
 
@@ -48,6 +52,19 @@ impl Object {
             Object::Shm => &["create_pool"],
             Object::ShmPool => &["create_buffer", "destroy", "resize"],
             Object::Buffer => &["destroy"],
+            Object::Surface => &[
+                "destroy",
+                "attach",
+                "damage",
+                "frame",
+                "set_opaque_region",
+                "set_input_region",
+                "commit",
+                "set_buffer_transform",
+                "set_buffer_scale",
+                "damage_buffer",
+            ],
+            Object::Region => &["destroy", "add", "subtract"],
         };
         names.get(usize::from(opcode)).copied().unwrap_or("?")
     }
@@ -62,6 +79,8 @@ impl Object {
             Object::Shm => &["format"],
             Object::ShmPool => &[],
             Object::Buffer => &["release"],
+            Object::Surface => &["enter", "leave"],
+            Object::Region => &[],
         };
         names.get(usize::from(opcode)).copied().unwrap_or("?")
     }
@@ -126,6 +145,56 @@ impl Buffer {
         let bytes: [u8; 4] = self.pool.map[start..start + 4].try_into().expect("4 bytes");
         u32::from_le_bytes(bytes)
     }
+}
+
+/// 컴포지터가 가진 그림 한 장. 버퍼에서 복사해 온 것이라 클라이언트가 버퍼를 고쳐도 바뀌지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    pub width: u32,
+    pub height: u32,
+    /// 한 줄씩 위에서 아래로, 픽셀 하나는 0xAARRGGBB.
+    pub pixels: Vec<u32>,
+}
+
+impl Image {
+    fn copy_from(buffer: &Buffer) -> Image {
+        let mut pixels = Vec::with_capacity(buffer.width as usize * buffer.height as usize);
+        for y in 0..buffer.height {
+            for x in 0..buffer.width {
+                let pixel = buffer.pixel(x, y);
+                // xrgb8888의 위 8비트는 쓰레기일 수 있다. 불투명으로 못 박는다.
+                if buffer.format == FORMAT_XRGB8888 {
+                    pixels.push(pixel | 0xff00_0000);
+                } else {
+                    pixels.push(pixel);
+                }
+            }
+        }
+        Image {
+            width: buffer.width,
+            height: buffer.height,
+            pixels,
+        }
+    }
+}
+
+/// 클라이언트가 commit하기 전까지 모아 두는 변경 사항.
+#[derive(Debug, Default)]
+pub struct PendingState {
+    /// `None`: 이번에 attach하지 않았다. `Some(None)`: 버퍼를 떼어 냈다. `Some(Some(id))`: 이 버퍼를 붙였다.
+    pub buffer: Option<Option<u32>>,
+    pub damaged: bool,
+    pub frame_callbacks: Vec<u32>,
+}
+
+/// 표면 하나: 대기 중인 변경과, 마지막으로 commit된 그림.
+#[derive(Debug, Default)]
+pub struct Surface {
+    pub pending: PendingState,
+    pub image: Option<Image>,
+    /// commit됐지만 아직 "그렸다"고 알리지 않은 frame 콜백들.
+    pub frame_callbacks: Vec<u32>,
+    pub commits: u32,
 }
 
 /// 클라이언트가 말한 버퍼가 풀 안에 들어가는지 확인한다. 말이 안 되면 `None`.
@@ -259,6 +328,7 @@ pub struct Client {
     pub fds: VecDeque<OwnedFd>,
     pub pools: HashMap<u32, Rc<Pool>>,
     pub buffers: HashMap<u32, Buffer>,
+    pub surfaces: HashMap<u32, Surface>,
     /// 켜 두면 주고받는 메시지를 한 줄씩 찍는다.
     pub log: bool,
 }
@@ -275,6 +345,7 @@ impl Client {
             fds: VecDeque::new(),
             pools: HashMap::new(),
             buffers: HashMap::new(),
+            surfaces: HashMap::new(),
             log: false,
         }
     }
@@ -452,6 +523,20 @@ impl Client {
                 self.buffers.remove(&header.object);
                 self.destroy(header.object);
             }
+            // wl_compositor.create_surface(id)
+            (Object::Compositor, 0) => {
+                let id = args.uint()?;
+                self.create(id, Object::Surface)?;
+                self.surfaces.insert(id, Surface::default());
+            }
+            // wl_compositor.create_region(id): 영역은 받아 두기만 하고 쓰지 않는다.
+            (Object::Compositor, 1) => {
+                let id = args.uint()?;
+                self.create(id, Object::Region)?;
+            }
+            (Object::Region, 0) => self.destroy(header.object),
+            (Object::Region, 1 | 2) => {}
+            (Object::Surface, opcode) => self.handle_surface(header.object, opcode, args)?,
             _ => {
                 return Err(ProtocolError::InvalidMethod {
                     object: header.object,
@@ -460,6 +545,94 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    fn handle_surface(
+        &mut self,
+        id: u32,
+        opcode: u16,
+        mut args: Args<'_>,
+    ) -> Result<(), ProtocolError> {
+        match opcode {
+            // destroy
+            0 => {
+                self.surfaces.remove(&id);
+                self.destroy(id);
+            }
+            // attach(buffer, x, y): 0번 객체는 "버퍼 없음"
+            1 => {
+                let buffer = args.uint()?;
+                let _offset = (args.int()?, args.int()?);
+                let surface = self.surfaces.get_mut(&id).expect("surface exists");
+                surface.pending.buffer = Some(if buffer == 0 { None } else { Some(buffer) });
+            }
+            // damage / damage_buffer: 어느 부분이 바뀌었는지. 이 컴포지터는 통째로 다시 그린다.
+            2 | 9 => {
+                self.surfaces
+                    .get_mut(&id)
+                    .expect("surface exists")
+                    .pending
+                    .damaged = true;
+            }
+            // frame(callback): 다음 그림을 그리기 좋은 때가 되면 알려 달라
+            3 => {
+                let callback = args.uint()?;
+                self.create(callback, Object::Callback)?;
+                let surface = self.surfaces.get_mut(&id).expect("surface exists");
+                surface.pending.frame_callbacks.push(callback);
+            }
+            // set_opaque_region, set_input_region, set_buffer_transform, set_buffer_scale: 무시한다
+            4 | 5 | 7 | 8 => {}
+            // commit: 모아 둔 변경을 한꺼번에 적용한다
+            6 => self.commit(id),
+            _ => return Err(ProtocolError::InvalidMethod { object: id, opcode }),
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, id: u32) {
+        let surface = self.surfaces.get_mut(&id).expect("surface exists");
+        let pending = std::mem::take(&mut surface.pending);
+        let mut released = None;
+        match pending.buffer {
+            Some(Some(buffer_id)) => {
+                if let Some(buffer) = self.buffers.get(&buffer_id) {
+                    surface.image = Some(Image::copy_from(buffer));
+                    released = Some(buffer_id);
+                }
+            }
+            Some(None) => surface.image = None,
+            None => {}
+        }
+        surface.frame_callbacks.extend(pending.frame_callbacks);
+        surface.commits += 1;
+        if self.log {
+            let size = surface
+                .image
+                .as_ref()
+                .map(|image| format!("{}x{}", image.width, image.height))
+                .unwrap_or_else(|| "no buffer".to_string());
+            println!(
+                "[{}]      surface#{id} commit {}: {size}",
+                self.id, surface.commits
+            );
+        }
+        // 픽셀을 복사해 왔으니 클라이언트는 그 버퍼를 다시 써도 된다.
+        if let Some(buffer_id) = released {
+            self.send(MessageBuilder::new(buffer_id, 0).finish());
+        }
+    }
+
+    /// 화면을 한 번 그렸다고 치고, 기다리던 frame 콜백에 모두 답한다.
+    pub fn frame_done(&mut self, time_ms: u32) {
+        let mut callbacks = Vec::new();
+        for surface in self.surfaces.values_mut() {
+            callbacks.append(&mut surface.frame_callbacks);
+        }
+        for callback in callbacks {
+            self.send(MessageBuilder::new(callback, 0).uint(time_ms).finish());
+            self.destroy(callback);
+        }
     }
 
     /// 객체를 지우고, 클라이언트에게 그 id를 다시 써도 된다고 알린다(wl_display.delete_id).
@@ -620,6 +793,50 @@ mod tests {
             client.receive(&too_big, &mut shared),
             Err(ProtocolError::Object { code: 1, .. })
         ));
+    }
+
+    #[test]
+    fn surface_changes_wait_for_commit() {
+        let mut shared = Shared::new();
+        let mut client = client_with_shm(&mut shared);
+        client.fds.push_back(memfd(16, 0x00abcdef));
+        let mut bytes = MessageBuilder::new(3, 0).uint(4).int(16).finish();
+        bytes.extend(
+            MessageBuilder::new(4, 0)
+                .uint(5)
+                .int(0)
+                .int(2)
+                .int(2)
+                .int(8)
+                .uint(FORMAT_XRGB8888)
+                .finish(),
+        );
+        // wl_compositor를 id 6으로 bind하고 표면 7을 만든다.
+        bytes.extend(
+            MessageBuilder::new(2, 0)
+                .uint(1)
+                .string("wl_compositor")
+                .uint(4)
+                .uint(6)
+                .finish(),
+        );
+        bytes.extend(MessageBuilder::new(6, 0).uint(7).finish());
+        bytes.extend(MessageBuilder::new(7, 1).uint(5).int(0).int(0).finish());
+        client.receive(&bytes, &mut shared).unwrap();
+        client.outgoing.clear();
+        assert_eq!(
+            client.surfaces[&7].image, None,
+            "attach alone changes nothing"
+        );
+
+        client
+            .receive(&MessageBuilder::new(7, 6).finish(), &mut shared)
+            .unwrap();
+        let image = client.surfaces[&7].image.as_ref().unwrap();
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(image.pixels[0], 0xffabcdef, "xrgb is made opaque");
+        let events = events(&mut client);
+        assert_eq!((events[0].0.object, events[0].0.opcode), (5, 0)); // buffer.release
     }
 
     #[test]
