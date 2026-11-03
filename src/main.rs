@@ -2,6 +2,7 @@ mod demo;
 
 use tinyline::command::{Command, HELP, parse_command};
 use tinyline::layout::{Desktop, Rect};
+use tinyline::server::{Socket, serve_one};
 
 fn main() {
     // `cargo run -- wire`로 실행하면 메시지 형식을 보여 주고 끝난다.
@@ -9,6 +10,12 @@ fn main() {
     if mode == "wire" {
         if let Err(error) = demo::wire_demo() {
             println!("wire demo stopped: {error}");
+        }
+        return;
+    }
+    if mode == "serve" {
+        if let Err(error) = serve() {
+            println!("server stopped: {error}");
         }
         return;
     }
@@ -63,5 +70,15 @@ fn main() {
         if let Some(window) = desktop.focused_window() {
             println!("[focus: #{} {}]", window.id, window.title);
         }
+    }
+}
+
+/// `cargo run -- serve`: 소켓을 열고 클라이언트를 하나씩 받는다.
+fn serve() -> std::io::Result<()> {
+    let socket = Socket::bind("tinyline-0")?;
+    println!("listening on {}", socket.path.display());
+    println!("try: WAYLAND_DISPLAY=tinyline-0 wayland-info");
+    loop {
+        serve_one(&socket)?;
     }
 }

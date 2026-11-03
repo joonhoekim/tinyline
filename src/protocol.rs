@@ -26,6 +26,28 @@ impl Object {
             Object::Compositor => "wl_compositor",
         }
     }
+
+    /// 요청 번호의 이름. 로그를 사람이 읽을 수 있게 하려는 것뿐이다.
+    pub fn request_name(self, opcode: u16) -> &'static str {
+        let names: &[&str] = match self {
+            Object::Display => &["sync", "get_registry"],
+            Object::Registry => &["bind"],
+            Object::Callback => &[],
+            Object::Compositor => &["create_surface", "create_region"],
+        };
+        names.get(usize::from(opcode)).copied().unwrap_or("?")
+    }
+
+    /// 이벤트 번호의 이름.
+    pub fn event_name(self, opcode: u16) -> &'static str {
+        let names: &[&str] = match self {
+            Object::Display => &["error", "delete_id"],
+            Object::Registry => &["global", "global_remove"],
+            Object::Callback => &["done"],
+            Object::Compositor => &[],
+        };
+        names.get(usize::from(opcode)).copied().unwrap_or("?")
+    }
 }
 
 /// 컴포지터가 클라이언트에게 "이런 기능이 있다"고 알리는 전역 객체.
@@ -99,6 +121,8 @@ pub struct Client {
     pub objects: HashMap<u32, Object>,
     pub outgoing: Vec<u8>,
     pub next_serial: u32,
+    /// 켜 두면 주고받는 메시지를 한 줄씩 찍는다.
+    pub log: bool,
 }
 
 impl Default for Client {
@@ -116,11 +140,32 @@ impl Client {
             objects,
             outgoing: Vec::new(),
             next_serial: 1,
+            log: false,
         }
     }
 
     pub fn send(&mut self, message: Vec<u8>) {
+        if self.log
+            && let Ok(Some((header, _))) = split_message(&message)
+        {
+            println!("  <- {}", self.describe(header, false));
+        }
         self.outgoing.extend_from_slice(&message);
+    }
+
+    /// "wl_registry#2.global" 같은 한 줄 이름.
+    fn describe(&self, header: Header, request: bool) -> String {
+        match self.objects.get(&header.object) {
+            Some(object) => {
+                let name = if request {
+                    object.request_name(header.opcode)
+                } else {
+                    object.event_name(header.opcode)
+                };
+                format!("{}#{}.{}", object.interface(), header.object, name)
+            }
+            None => format!("?#{} opcode {}", header.object, header.opcode),
+        }
     }
 
     /// 새 객체를 표에 넣는다. 이미 있는 id면 에러.
@@ -139,6 +184,9 @@ impl Client {
     pub fn receive(&mut self, bytes: &[u8]) -> Result<usize, ProtocolError> {
         let mut used = 0;
         while let Some((header, body)) = split_message(&bytes[used..])? {
+            if self.log {
+                println!("-> {}", self.describe(header, true));
+            }
             self.handle(header, body)?;
             used += usize::from(header.size);
         }
