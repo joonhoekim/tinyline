@@ -1,11 +1,14 @@
 //! 유닉스 소켓을 열고, 여러 클라이언트와 동시에 바이트를 주고받는다.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSliceMut, Write};
+use std::mem::MaybeUninit;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 use rustix::event::{PollFd, PollFlags, poll};
+use rustix::io::Errno;
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
 
 use crate::protocol::{Client, Shared};
 
@@ -47,13 +50,29 @@ struct Connection {
 
 impl Connection {
     /// 읽을 것이 있다고 poll이 알려 준 연결에서 한 번 읽고, 처리하고, 답을 보낸다.
+    ///
+    /// 바이트와 함께 파일 디스크립터가 올 수 있으므로 `read` 대신 `recvmsg`로 읽는다.
     fn on_readable(&mut self, shared: &mut Shared) -> io::Result<()> {
         let mut chunk = [0u8; 4096];
-        let count = match self.stream.read(&mut chunk) {
-            Ok(count) => count,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) => return Err(error),
+        // 메시지 한 번에 fd가 최대 28개까지 올 수 있다(libwayland가 한 번에 보내는 최대치).
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(28))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        let received = recvmsg(
+            &self.stream,
+            &mut [IoSliceMut::new(&mut chunk)],
+            &mut control,
+            RecvFlags::CMSG_CLOEXEC,
+        );
+        let count = match received {
+            Ok(message) => message.bytes,
+            Err(Errno::AGAIN) => return Ok(()),
+            Err(error) => return Err(error.into()),
         };
+        for message in control.drain() {
+            if let RecvAncillaryMessage::ScmRights(fds) = message {
+                self.client.fds.extend(fds);
+            }
+        }
         if count == 0 {
             println!("[{}] hung up", self.client.id);
             self.closed = true;
