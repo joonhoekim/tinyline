@@ -83,6 +83,8 @@ struct Desktop {
     output: Rect,
     windows: Vec<Window>,
     next_id: u32,
+    /// 키보드 입력을 받을 창. 창이 하나도 없으면 없다.
+    focused: Option<u32>,
 }
 
 impl Desktop {
@@ -91,10 +93,12 @@ impl Desktop {
             output,
             windows: Vec::new(),
             next_id: 1,
+            focused: None,
         }
     }
 
-    /// 새 창을 열고 그 id를 돌려준다. 창을 열 때마다 화면을 다시 나눈다.
+    /// 새 창을 열고 그 id를 돌려준다. 창을 열 때마다 화면을 다시 나누고,
+    /// 새 창에 포커스를 준다.
     fn open(&mut self, title: &str) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -104,18 +108,60 @@ impl Desktop {
             rect: self.output,
         });
         self.relayout();
+        self.focused = Some(id);
         id
     }
 
+    /// id에 해당하는 창의 목록 안 위치.
+    fn index_of(&self, id: u32) -> Option<usize> {
+        self.windows.iter().position(|w| w.id == id)
+    }
+
     /// id에 해당하는 창을 닫는다. 그런 창이 없었으면 false.
+    ///
+    /// 포커스된 창을 닫으면 그 자리를 이어받은 창(없으면 마지막 창)에 포커스를 넘긴다.
     fn close(&mut self, id: u32) -> bool {
-        let before = self.windows.len();
-        self.windows.retain(|w| w.id != id);
-        let closed = self.windows.len() != before;
-        if closed {
-            self.relayout();
+        let Some(index) = self.index_of(id) else {
+            return false;
+        };
+        self.windows.remove(index);
+        if self.focused == Some(id) {
+            let next = index.min(self.windows.len().saturating_sub(1));
+            self.focused = self.windows.get(next).map(|w| w.id);
         }
-        closed
+        self.relayout();
+        true
+    }
+
+    /// id에 해당하는 창에 포커스를 준다. 그런 창이 없으면 false.
+    fn focus(&mut self, id: u32) -> bool {
+        if self.index_of(id).is_none() {
+            return false;
+        }
+        self.focused = Some(id);
+        true
+    }
+
+    /// 포커스를 오른쪽 창으로 옮긴다. 마지막 창에서는 첫 창으로 돌아간다.
+    fn focus_next(&mut self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        let next = match self.focused.and_then(|id| self.index_of(id)) {
+            Some(index) => (index + 1) % self.windows.len(),
+            None => 0,
+        };
+        self.focused = Some(self.windows[next].id);
+    }
+
+    fn focused_window(&self) -> Option<&Window> {
+        let id = self.focused?;
+        self.windows.iter().find(|w| w.id == id)
+    }
+
+    /// (x, y)를 클릭하면 맞는 창. 나중에 연 창이 위에 있으므로 뒤에서부터 찾는다.
+    fn window_at(&self, x: i32, y: i32) -> Option<&Window> {
+        self.windows.iter().rev().find(|w| w.rect.contains(x, y))
     }
 
     /// 지금 열린 창들에 화면을 고르게 나눠 준다.
@@ -145,8 +191,13 @@ impl Desktop {
     fn print(&self) {
         println!("{} window(s):", self.windows.len());
         for window in &self.windows {
+            let mark = if self.focused == Some(window.id) {
+                '*'
+            } else {
+                ' '
+            };
             println!(
-                "  #{} {:?} at {:?} ({} px)",
+                " {mark}#{} {:?} at {:?} ({} px)",
                 window.id,
                 window.title,
                 window.rect,
@@ -160,23 +211,41 @@ fn main() {
     let mut desktop = Desktop::new(Rect::new(0, 0, 1920, 1080));
 
     let terminal = desktop.open("terminal");
-    desktop.open("browser");
-    desktop.open("editor");
+    let browser = desktop.open("browser");
+    let editor = desktop.open("editor");
     desktop.print();
     println!("overlapping pairs: {}", desktop.overlapping_pairs());
 
-    // 클릭한 곳에 있는 창 찾기: 나중에 연 창이 위에 있으므로 뒤에서부터 본다.
-    for window in desktop.windows.iter().rev() {
-        if window.rect.contains(10, 10) {
-            println!("click (10, 10) hits #{} {:?}", window.id, window.title);
-            break;
-        }
+    // 클릭하면 그 창에 포커스가 간다
+    if let Some(window) = desktop.window_at(10, 10) {
+        let id = window.id;
+        println!("click (10, 10) hits #{id} {:?}", window.title);
+        desktop.focus(id);
     }
+    match desktop.window_at(5000, 10) {
+        Some(window) => println!("click (5000, 10) hits #{}", window.id),
+        None => println!("click (5000, 10) hits nothing"),
+    }
+
+    desktop.focus_next();
+    let title = desktop
+        .focused_window()
+        .map(|w| w.title.as_str())
+        .unwrap_or("(none)");
+    println!("after focus_next: {title}");
 
     println!("close #{terminal}: {}", desktop.close(terminal));
     println!("close #{terminal} again: {}", desktop.close(terminal));
     desktop.print();
     println!("overlapping pairs: {}", desktop.overlapping_pairs());
+
+    desktop.close(browser);
+    desktop.close(editor);
+    let title = desktop
+        .focused_window()
+        .map(|w| w.title.as_str())
+        .unwrap_or("(none)");
+    println!("after closing everything, focused: {title}");
 
     // 나누어떨어지지 않을 때: 1000을 세 칸으로
     let widths: Vec<u32> = tile(Rect::new(0, 0, 1000, 100), 3)
