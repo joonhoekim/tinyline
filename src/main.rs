@@ -2,7 +2,7 @@ mod demo;
 
 use tinyline::command::{Command, HELP, parse_command};
 use tinyline::layout::{Desktop, Rect};
-use tinyline::server::{Socket, serve_one};
+use tinyline::server::{Socket, run};
 
 fn main() {
     // `cargo run -- wire`로 실행하면 메시지 형식을 보여 주고 끝난다.
@@ -73,12 +73,10 @@ fn main() {
     }
 }
 
-/// `cargo run -- serve`: 소켓을 열고 클라이언트를 하나씩 받는다.
+/// `cargo run -- serve`: 소켓을 열고 여러 클라이언트를 동시에 받는다.
 fn serve() -> std::io::Result<()> {
     let socket = Socket::bind("tinyline-0")?;
     println!("listening on {}", socket.path.display());
     println!("try: WAYLAND_DISPLAY=tinyline-0 wayland-info");
-    loop {
-        serve_one(&socket)?;
-    }
+    run(&socket)
 }

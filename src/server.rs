@@ -1,11 +1,13 @@
-//! 유닉스 소켓을 열고 클라이언트와 바이트를 주고받는다.
+//! 유닉스 소켓을 열고, 여러 클라이언트와 동시에 바이트를 주고받는다.
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
-use crate::protocol::Client;
+use rustix::event::{PollFd, PollFlags, poll};
+
+use crate::protocol::{Client, Shared};
 
 /// `$XDG_RUNTIME_DIR` 안에 만든 소켓 파일. 이 값이 사라질 때 파일도 지운다.
 pub struct Socket {
@@ -35,38 +37,99 @@ impl Drop for Socket {
     }
 }
 
-/// 클라이언트 하나를 받아, 연결이 끝날 때까지 대화한다.
-pub fn serve_one(socket: &Socket) -> io::Result<()> {
-    let (mut stream, _) = socket.listener.accept()?;
-    println!("client connected");
-    let mut client = Client::new();
-    client.log = true;
+/// 연결 하나: 소켓, 그 클라이언트의 프로토콜 상태, 아직 처리하지 못한 바이트.
+struct Connection {
+    stream: UnixStream,
+    client: Client,
+    pending: Vec<u8>,
+    closed: bool,
+}
 
-    // 소켓에서 읽은 바이트 중 아직 처리하지 못한 것(덜 도착한 메시지)
-    let mut pending: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let count = stream.read(&mut chunk)?;
+impl Connection {
+    /// 읽을 것이 있다고 poll이 알려 준 연결에서 한 번 읽고, 처리하고, 답을 보낸다.
+    fn on_readable(&mut self, shared: &mut Shared) -> io::Result<()> {
+        let mut chunk = [0u8; 4096];
+        let count = match self.stream.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        };
         if count == 0 {
-            println!("client hung up");
+            println!("[{}] hung up", self.client.id);
+            self.closed = true;
             return Ok(());
         }
-        pending.extend_from_slice(&chunk[..count]);
+        self.pending.extend_from_slice(&chunk[..count]);
 
-        let result = client.receive(&pending);
-        match result {
+        match self.client.receive(&self.pending, shared) {
             Ok(used) => {
-                pending.drain(..used);
+                self.pending.drain(..used);
             }
-            Err(ref error) => {
-                println!("protocol error: {error}");
-                client.send_error(error);
+            Err(error) => {
+                println!("[{}] protocol error: {error}", self.client.id);
+                self.client.send_error(&error);
+                self.closed = true;
             }
         }
-        stream.write_all(&client.outgoing)?;
-        client.outgoing.clear();
-        if result.is_err() {
-            return Ok(());
+        self.stream.write_all(&self.client.outgoing)?;
+        self.client.outgoing.clear();
+        Ok(())
+    }
+}
+
+/// 소켓 하나와 연결된 클라이언트들을 돌보는 이벤트 루프. 돌아오지 않는다.
+pub fn run(socket: &Socket) -> io::Result<()> {
+    socket.listener.set_nonblocking(true)?;
+    let mut shared = Shared::new();
+    let mut connections: Vec<Connection> = Vec::new();
+    let mut next_id = 1;
+
+    loop {
+        // 1. 무엇이 준비됐는지 묻는다. 첫 칸은 새 접속, 나머지는 연결마다 하나씩.
+        let mut fds = Vec::with_capacity(1 + connections.len());
+        fds.push(PollFd::new(&socket.listener, PollFlags::IN));
+        for connection in &connections {
+            fds.push(PollFd::new(&connection.stream, PollFlags::IN));
         }
+        poll(&mut fds, None)?;
+
+        // 2. 결과만 따로 옮겨 적는다. `fds`는 연결들을 빌려 들고 있어서,
+        //    이게 살아 있는 동안에는 연결을 고칠 수 없다.
+        let ready: Vec<bool> = fds.iter().map(|fd| !fd.revents().is_empty()).collect();
+        drop(fds);
+
+        // 3. 새 접속을 받는다. 논블로킹이므로 더 없으면 WouldBlock이 온다.
+        if ready[0] {
+            loop {
+                match socket.listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(true)?;
+                        let mut client = Client::new(next_id);
+                        client.log = true;
+                        println!("[{next_id}] connected");
+                        next_id += 1;
+                        connections.push(Connection {
+                            stream,
+                            client,
+                            pending: Vec::new(),
+                            closed: false,
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        // 4. 읽을 것이 있는 연결을 처리한다. 방금 받은 연결은 `ready`에 칸이 없다.
+        for (connection, is_ready) in connections.iter_mut().zip(&ready[1..]) {
+            if *is_ready && let Err(error) = connection.on_readable(&mut shared) {
+                println!("[{}] i/o error: {error}", connection.client.id);
+                connection.closed = true;
+            }
+        }
+
+        // 5. 끝난 연결을 치운다. 연결이 사라지면 소켓도 닫힌다.
+        connections.retain(|connection| !connection.closed);
     }
 }

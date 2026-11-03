@@ -1,6 +1,6 @@
 //! `cargo run -- wire` · `cargo run -- protocol`로 보는 시연. 실행 파일에만 있다.
 
-use tinyline::protocol::Client;
+use tinyline::protocol::{Client, Shared};
 use tinyline::wire::{Args, HEADER_SIZE, Header, MessageBuilder, WireError, split_message};
 
 /// 바이트를 4개씩 끊어 16진수로 보여 준다.
@@ -100,7 +100,8 @@ fn print_events(bytes: &[u8]) -> Result<(), WireError> {
 }
 
 pub fn protocol_demo() -> Result<(), WireError> {
-    let mut client = Client::new();
+    let mut client = Client::new(1);
+    let mut shared = Shared::new();
 
     // 클라이언트가 보낸다고 치는 요청들: get_registry(2), sync(3), bind(1, wl_compositor, 4, id 4)
     let mut requests = MessageBuilder::new(1, 1).uint(2).finish();
@@ -114,7 +115,7 @@ pub fn protocol_demo() -> Result<(), WireError> {
             .finish(),
     );
     println!("-> get_registry(2), sync(3), bind(1, \"wl_compositor\", 4, id 4)");
-    match client.receive(&requests) {
+    match client.receive(&requests, &mut shared) {
         Ok(used) => println!("  handled {used} bytes"),
         Err(error) => println!("  error: {error}"),
     }
@@ -132,7 +133,7 @@ pub fn protocol_demo() -> Result<(), WireError> {
     // 규칙 위반: 없는 객체 9에 메시지를 보낸다
     println!("-> object 9, opcode 0");
     let bad = MessageBuilder::new(9, 0).finish();
-    if let Err(error) = client.receive(&bad) {
+    if let Err(error) = client.receive(&bad, &mut shared) {
         client.send_error(&error);
     }
     print_events(&std::mem::take(&mut client.outgoing))?;
@@ -140,7 +141,7 @@ pub fn protocol_demo() -> Result<(), WireError> {
     // 규칙 위반: 이미 있는 id 2로 레지스트리를 또 만든다
     println!("-> get_registry(2) again");
     let again = MessageBuilder::new(1, 1).uint(2).finish();
-    if let Err(error) = client.receive(&again) {
+    if let Err(error) = client.receive(&again, &mut shared) {
         client.send_error(&error);
     }
     print_events(&std::mem::take(&mut client.outgoing))?;

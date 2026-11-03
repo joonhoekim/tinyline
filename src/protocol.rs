@@ -116,30 +116,49 @@ impl ProtocolError {
     }
 }
 
+/// 모든 클라이언트가 함께 쓰는 컴포지터 쪽 상태.
+pub struct Shared {
+    next_serial: u32,
+}
+
+impl Default for Shared {
+    fn default() -> Shared {
+        Shared::new()
+    }
+}
+
+impl Shared {
+    pub fn new() -> Shared {
+        Shared { next_serial: 1 }
+    }
+
+    /// 컴포지터 전체에서 하나씩 늘어나는 번호. 어느 클라이언트에 주든 겹치지 않는다.
+    pub fn next_serial(&mut self) -> u32 {
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        serial
+    }
+}
+
 /// 연결된 클라이언트 하나의 상태: 객체 표와 보낼 바이트.
 pub struct Client {
     pub objects: HashMap<u32, Object>,
     pub outgoing: Vec<u8>,
-    pub next_serial: u32,
+    /// 로그에 찍을 클라이언트 번호.
+    pub id: u32,
     /// 켜 두면 주고받는 메시지를 한 줄씩 찍는다.
     pub log: bool,
 }
 
-impl Default for Client {
-    fn default() -> Client {
-        Client::new()
-    }
-}
-
 impl Client {
-    pub fn new() -> Client {
+    pub fn new(id: u32) -> Client {
         let mut objects = HashMap::new();
         // 객체 1번은 언제나 wl_display다. 접속하는 순간부터 있다.
         objects.insert(1, Object::Display);
         Client {
             objects,
             outgoing: Vec::new(),
-            next_serial: 1,
+            id,
             log: false,
         }
     }
@@ -148,7 +167,7 @@ impl Client {
         if self.log
             && let Ok(Some((header, _))) = split_message(&message)
         {
-            println!("  <- {}", self.describe(header, false));
+            println!("[{}]   <- {}", self.id, self.describe(header, false));
         }
         self.outgoing.extend_from_slice(&message);
     }
@@ -181,19 +200,24 @@ impl Client {
 
     /// 받은 바이트에서 완성된 메시지를 모두 처리하고, 처리한 바이트 수를 돌려준다.
     /// 끝에 덜 온 메시지가 남아 있으면 그 앞까지만 처리한다.
-    pub fn receive(&mut self, bytes: &[u8]) -> Result<usize, ProtocolError> {
+    pub fn receive(&mut self, bytes: &[u8], shared: &mut Shared) -> Result<usize, ProtocolError> {
         let mut used = 0;
         while let Some((header, body)) = split_message(&bytes[used..])? {
             if self.log {
-                println!("-> {}", self.describe(header, true));
+                println!("[{}] -> {}", self.id, self.describe(header, true));
             }
-            self.handle(header, body)?;
+            self.handle(header, body, shared)?;
             used += usize::from(header.size);
         }
         Ok(used)
     }
 
-    fn handle(&mut self, header: Header, body: &[u8]) -> Result<(), ProtocolError> {
+    fn handle(
+        &mut self,
+        header: Header,
+        body: &[u8],
+        shared: &mut Shared,
+    ) -> Result<(), ProtocolError> {
         let object = *self
             .objects
             .get(&header.object)
@@ -204,8 +228,7 @@ impl Client {
             (Object::Display, 0) => {
                 let callback = args.uint()?;
                 self.create(callback, Object::Callback)?;
-                let serial = self.next_serial;
-                self.next_serial += 1;
+                let serial = shared.next_serial();
                 self.send(MessageBuilder::new(callback, 0).uint(serial).finish());
                 self.destroy(callback);
             }
@@ -286,9 +309,9 @@ mod tests {
 
     #[test]
     fn sync_is_answered_and_its_id_released() {
-        let mut client = Client::new();
+        let mut client = Client::new(1);
         let sync = MessageBuilder::new(1, 0).uint(5).finish();
-        assert_eq!(client.receive(&sync), Ok(12));
+        assert_eq!(client.receive(&sync, &mut Shared::new()), Ok(12));
         let events = events(&mut client);
         assert_eq!(events.len(), 2);
         assert_eq!((events[0].0.object, events[0].0.opcode), (5, 0)); // callback.done
@@ -299,9 +322,12 @@ mod tests {
 
     #[test]
     fn registry_announces_globals_and_bind_creates_object() {
-        let mut client = Client::new();
+        let mut client = Client::new(1);
         client
-            .receive(&MessageBuilder::new(1, 1).uint(2).finish())
+            .receive(
+                &MessageBuilder::new(1, 1).uint(2).finish(),
+                &mut Shared::new(),
+            )
             .unwrap();
         let events = events(&mut client);
         assert_eq!(events.len(), GLOBALS.len());
@@ -311,31 +337,34 @@ mod tests {
             .uint(4)
             .uint(3)
             .finish();
-        client.receive(&bind).unwrap();
+        client.receive(&bind, &mut Shared::new()).unwrap();
         assert_eq!(client.objects.get(&3), Some(&Object::Compositor));
     }
 
     #[test]
     fn partial_messages_are_left_for_later() {
-        let mut client = Client::new();
+        let mut client = Client::new(1);
         let mut bytes = MessageBuilder::new(1, 0).uint(5).finish();
         bytes.extend_from_slice(&MessageBuilder::new(1, 0).uint(6).finish()[..4]);
-        assert_eq!(client.receive(&bytes), Ok(12));
+        assert_eq!(client.receive(&bytes, &mut Shared::new()), Ok(12));
     }
 
     #[test]
     fn protocol_errors() {
-        let mut client = Client::new();
+        let mut client = Client::new(1);
         assert_eq!(
-            client.receive(&MessageBuilder::new(9, 0).finish()),
+            client.receive(&MessageBuilder::new(9, 0).finish(), &mut Shared::new()),
             Err(ProtocolError::UnknownObject(9))
         );
         assert_eq!(
-            client.receive(&MessageBuilder::new(1, 1).uint(1).finish()),
+            client.receive(
+                &MessageBuilder::new(1, 1).uint(1).finish(),
+                &mut Shared::new()
+            ),
             Err(ProtocolError::IdInUse(1))
         );
         assert_eq!(
-            client.receive(&MessageBuilder::new(1, 7).finish()),
+            client.receive(&MessageBuilder::new(1, 7).finish(), &mut Shared::new()),
             Err(ProtocolError::InvalidMethod {
                 object: 1,
                 opcode: 7
