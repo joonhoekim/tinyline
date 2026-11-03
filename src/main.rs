@@ -223,15 +223,63 @@ struct Header {
 
 const HEADER_SIZE: usize = 8;
 
-/// 바이트 앞부분에서 머리를 읽는다. 8바이트가 안 되면 `None`.
-fn read_header(bytes: &[u8]) -> Option<Header> {
-    let object = u32::from_ne_bytes(bytes.get(0..4)?.try_into().ok()?);
-    let word = u32::from_ne_bytes(bytes.get(4..8)?.try_into().ok()?);
-    Some(Header {
+/// 메시지를 읽다가 생길 수 있는 문제들.
+#[derive(Debug, PartialEq, Eq)]
+enum WireError {
+    /// 인자를 읽으려는데 바이트가 모자란다.
+    Truncated { needed: usize, available: usize },
+    /// 머리에 적힌 길이가 머리보다 짧거나 4의 배수가 아니다.
+    BadSize(u16),
+    /// 문자열의 길이가 0이거나, 끝에 0 바이트가 없다.
+    BadString,
+    /// 문자열이 UTF-8이 아니다.
+    NotUtf8,
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireError::Truncated { needed, available } => {
+                write!(f, "needed {needed} bytes but only {available} are left")
+            }
+            WireError::BadSize(size) => write!(f, "message size {size} is invalid"),
+            WireError::BadString => write!(f, "string is not terminated by a 0 byte"),
+            WireError::NotUtf8 => write!(f, "string is not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
+/// 4바이트를 숫자 하나로. 길이가 정확히 4인 조각만 받는다.
+fn word(bytes: &[u8]) -> [u8; 4] {
+    bytes.try_into().expect("caller passes exactly 4 bytes")
+}
+
+/// 바이트 앞부분에서 메시지 하나를 잘라 낸다.
+///
+/// - 메시지 하나가 다 도착했으면 `Ok(Some((머리, 인자 바이트)))`
+/// - 아직 덜 왔으면 `Ok(None)` — 더 받은 뒤 다시 부르면 된다
+/// - 머리부터 말이 안 되면 `Err`
+fn split_message(bytes: &[u8]) -> Result<Option<(Header, &[u8])>, WireError> {
+    if bytes.len() < HEADER_SIZE {
+        return Ok(None);
+    }
+    let object = u32::from_ne_bytes(word(&bytes[0..4]));
+    let packed = u32::from_ne_bytes(word(&bytes[4..8]));
+    let header = Header {
         object,
-        opcode: (word & 0xffff) as u16,
-        size: (word >> 16) as u16,
-    })
+        opcode: (packed & 0xffff) as u16,
+        size: (packed >> 16) as u16,
+    };
+    let size = usize::from(header.size);
+    if size < HEADER_SIZE || !size.is_multiple_of(4) {
+        return Err(WireError::BadSize(header.size));
+    }
+    if bytes.len() < size {
+        return Ok(None);
+    }
+    Ok(Some((header, &bytes[HEADER_SIZE..size])))
 }
 
 /// 메시지 하나를 바이트로 조립한다. 인자를 순서대로 붙인 뒤 `finish`로 머리를 씌운다.
@@ -298,30 +346,39 @@ impl<'a> Args<'a> {
         Args { bytes, position: 0 }
     }
 
-    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
-        let end = self.position.checked_add(count)?;
-        let chunk = self.bytes.get(self.position..end)?;
-        self.position = end;
-        Some(chunk)
-    }
-
-    fn uint(&mut self) -> Option<u32> {
-        Some(u32::from_ne_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn int(&mut self) -> Option<i32> {
-        Some(i32::from_ne_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn string(&mut self) -> Option<&'a str> {
-        let length = usize::try_from(self.uint()?).ok()?;
-        let padded = length.checked_add(3)? / 4 * 4;
-        let chunk = self.take(padded)?;
-        let (text, terminator) = chunk.get(..length)?.split_at(length.checked_sub(1)?);
-        if terminator != [0] {
-            return None;
+    fn take(&mut self, count: usize) -> Result<&'a [u8], WireError> {
+        let available = self.bytes.len() - self.position;
+        if count > available {
+            return Err(WireError::Truncated {
+                needed: count,
+                available,
+            });
         }
-        std::str::from_utf8(text).ok()
+        let chunk = &self.bytes[self.position..self.position + count];
+        self.position += count;
+        Ok(chunk)
+    }
+
+    fn uint(&mut self) -> Result<u32, WireError> {
+        Ok(u32::from_ne_bytes(word(self.take(4)?)))
+    }
+
+    fn int(&mut self) -> Result<i32, WireError> {
+        Ok(i32::from_ne_bytes(word(self.take(4)?)))
+    }
+
+    fn string(&mut self) -> Result<&'a str, WireError> {
+        let length = usize::try_from(self.uint()?).expect("u32 fits in usize");
+        if length == 0 {
+            return Err(WireError::BadString);
+        }
+        let padded = length.div_ceil(4) * 4;
+        let chunk = self.take(padded)?;
+        let (text, rest) = chunk.split_at(length - 1);
+        if rest[0] != 0 {
+            return Err(WireError::BadString);
+        }
+        std::str::from_utf8(text).map_err(|_| WireError::NotUtf8)
     }
 }
 
@@ -334,7 +391,7 @@ fn hex(bytes: &[u8]) -> String {
     words.join(" ")
 }
 
-fn wire_demo() {
+fn wire_demo() -> Result<(), WireError> {
     // 클라이언트가 접속하자마자 보내는 두 요청
     // wl_display(객체 1).get_registry(새 객체 2)  — opcode 1
     // wl_display(객체 1).sync(새 객체 3)          — opcode 0
@@ -343,42 +400,50 @@ fn wire_demo() {
     println!("get_registry: {}", hex(&get_registry));
     println!("sync:         {}", hex(&sync));
 
-    // 두 메시지가 이어 붙어 소켓으로 온다고 치고, 앞에서부터 잘라 읽는다.
+    // 두 메시지가 이어 붙어 왔고, 세 번째 메시지는 앞 5바이트만 도착했다고 치자.
     let mut stream = get_registry.clone();
     stream.extend_from_slice(&sync);
+    stream.extend_from_slice(&sync[..5]);
     let mut rest = stream.as_slice();
-    while let Some(header) = read_header(rest) {
-        let size = usize::from(header.size);
-        let mut args = Args::new(&rest[HEADER_SIZE..size]);
-        println!("{header:?} new_id={:?}", args.uint());
-        rest = &rest[size..];
+    while let Some((header, body)) = split_message(rest)? {
+        let new_id = Args::new(body).uint()?;
+        println!("{header:?} new_id={new_id}");
+        rest = &rest[usize::from(header.size)..];
+    }
+    println!("waiting for {} more byte(s)", HEADER_SIZE - rest.len());
+
+    // 망가진 메시지들
+    let too_small = MessageBuilder::new(1, 0).finish();
+    let mut bad_size = too_small.clone();
+    bad_size[6] = 6; // 길이를 6으로: 머리(8바이트)보다 짧다
+    println!("bad size:   {:?}", split_message(&bad_size));
+
+    let short = MessageBuilder::new(1, 0).finish();
+    let (_, body) = split_message(&short)?.expect("complete");
+    match Args::new(body).uint() {
+        Ok(value) => println!("got {value}"),
+        Err(error) => println!("short body: {error}"),
     }
 
-    // 컴포지터가 보내는 이벤트: wl_registry(객체 2).global(이름 1, "wl_compositor", 버전 6)
-    let global = MessageBuilder::new(2, 0)
-        .uint(1)
-        .string("wl_compositor")
-        .uint(6)
-        .finish();
-    println!("global:       {}", hex(&global));
-    let header = read_header(&global).expect("we just built it");
-    let mut args = Args::new(&global[HEADER_SIZE..]);
-    println!(
-        "{header:?} name={:?} interface={:?} version={:?}",
-        args.uint(),
-        args.string(),
-        args.uint()
-    );
+    let mut not_utf8 = MessageBuilder::new(2, 0).string("ab").finish();
+    not_utf8[12] = 0xff;
+    let (_, body) = split_message(&not_utf8)?.expect("complete");
+    if let Err(error) = Args::new(body).string() {
+        println!("bad string: {error}");
+    }
 
     // 음수 좌표도 같은 4바이트에 담긴다
     let attach = MessageBuilder::new(5, 1).uint(0).int(-20).int(10).finish();
-    let mut args = Args::new(&attach[HEADER_SIZE..]);
-    println!(
-        "attach args: buffer={:?} x={:?} y={:?}",
-        args.uint(),
-        args.int(),
-        args.int()
-    );
+    let (_, body) = split_message(&attach)?.expect("complete");
+    let mut args = Args::new(body);
+    let (buffer, x, y) = (args.uint()?, args.int()?, args.int()?);
+    println!("attach: buffer={buffer} x={x} y={y}");
+
+    // ?는 에러를 만나면 그 자리에서 함수를 끝내고 에러를 호출한 쪽으로 돌려준다.
+    let (_, body) = split_message(&short)?.expect("complete");
+    let value = Args::new(body).uint()?;
+    println!("never printed: {value}");
+    Ok(())
 }
 
 /// 사용자가 입력한 명령 한 줄.
@@ -429,7 +494,9 @@ fn main() {
     // `cargo run -- wire`로 실행하면 메시지 형식을 보여 주고 끝난다.
     let mode = std::env::args().nth(1).unwrap_or_default();
     if mode == "wire" {
-        wire_demo();
+        if let Err(error) = wire_demo() {
+            println!("wire demo stopped: {error}");
+        }
         return;
     }
 
@@ -572,15 +639,31 @@ mod tests {
     fn header_round_trip() {
         let bytes = MessageBuilder::new(7, 3).uint(42).finish();
         assert_eq!(bytes.len(), 12);
+        let (header, body) = split_message(&bytes).unwrap().unwrap();
         assert_eq!(
-            read_header(&bytes),
-            Some(Header {
+            header,
+            Header {
                 object: 7,
                 opcode: 3,
                 size: 12
-            })
+            }
         );
-        assert_eq!(read_header(&bytes[..7]), None);
+        assert_eq!(Args::new(body).uint(), Ok(42));
+    }
+
+    #[test]
+    fn incomplete_messages_wait_for_more() {
+        let bytes = MessageBuilder::new(7, 3).uint(42).finish();
+        for cut in 0..bytes.len() {
+            assert_eq!(split_message(&bytes[..cut]), Ok(None), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_sizes() {
+        let mut bytes = MessageBuilder::new(1, 0).uint(0).finish();
+        bytes[6] = 10; // 4의 배수가 아니다
+        assert_eq!(split_message(&bytes), Err(WireError::BadSize(10)));
     }
 
     #[test]
@@ -588,9 +671,10 @@ mod tests {
         for text in ["", "a", "abc", "abcd", "wl_compositor"] {
             let bytes = MessageBuilder::new(1, 0).string(text).uint(99).finish();
             assert_eq!(bytes.len() % 4, 0);
-            let mut args = Args::new(&bytes[HEADER_SIZE..]);
-            assert_eq!(args.string(), Some(text));
-            assert_eq!(args.uint(), Some(99));
+            let (_, body) = split_message(&bytes).unwrap().unwrap();
+            let mut args = Args::new(body);
+            assert_eq!(args.string(), Ok(text));
+            assert_eq!(args.uint(), Ok(99));
         }
     }
 
@@ -598,9 +682,26 @@ mod tests {
     fn reading_past_the_end_fails() {
         let bytes = MessageBuilder::new(1, 0).uint(1).finish();
         let mut args = Args::new(&bytes[HEADER_SIZE..]);
-        assert_eq!(args.uint(), Some(1));
-        assert_eq!(args.uint(), None);
-        assert_eq!(args.int(), None);
+        assert_eq!(args.uint(), Ok(1));
+        assert_eq!(
+            args.uint(),
+            Err(WireError::Truncated {
+                needed: 4,
+                available: 0
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_bad_strings() {
+        let mut bytes = MessageBuilder::new(1, 0).string("abc").finish();
+        bytes[HEADER_SIZE + 4 + 3] = b'!'; // 끝의 0 바이트를 덮어쓴다
+        assert_eq!(
+            Args::new(&bytes[HEADER_SIZE..]).string(),
+            Err(WireError::BadString)
+        );
+        let zero_length = 0u32.to_ne_bytes();
+        assert_eq!(Args::new(&zero_length).string(), Err(WireError::BadString));
     }
 
     #[test]
