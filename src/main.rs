@@ -204,53 +204,98 @@ impl Desktop {
                 window.rect.area()
             );
         }
+        println!("overlapping pairs: {}", self.overlapping_pairs());
     }
 }
 
+/// 사용자가 입력한 명령 한 줄.
+#[derive(Debug, PartialEq)]
+enum Command {
+    Open(String),
+    Close(u32),
+    Focus(u32),
+    Next,
+    Click { x: i32, y: i32 },
+    List,
+    Help,
+    Quit,
+}
+
+/// 명령 한 줄을 해석한다. 알아들을 수 없는 줄이면 `None`.
+fn parse_command(line: &str) -> Option<Command> {
+    let mut words = line.split_whitespace();
+    let name = words.next()?;
+    let command = match name {
+        "open" => {
+            let title: Vec<&str> = words.collect();
+            if title.is_empty() {
+                return None;
+            }
+            Command::Open(title.join(" "))
+        }
+        "close" => Command::Close(words.next()?.parse().ok()?),
+        "focus" => Command::Focus(words.next()?.parse().ok()?),
+        "next" => Command::Next,
+        "click" => {
+            let x = words.next()?.parse().ok()?;
+            let y = words.next()?.parse().ok()?;
+            Command::Click { x, y }
+        }
+        "list" => Command::List,
+        "help" => Command::Help,
+        "quit" | "exit" => Command::Quit,
+        _ => return None,
+    };
+    Some(command)
+}
+
+const HELP: &str =
+    "commands: open <title> | close <id> | focus <id> | next | click <x> <y> | list | help | quit";
+
 fn main() {
     let mut desktop = Desktop::new(Rect::new(0, 0, 1920, 1080));
+    println!("{HELP}");
 
-    let terminal = desktop.open("terminal");
-    let browser = desktop.open("browser");
-    let editor = desktop.open("editor");
-    desktop.print();
-    println!("overlapping pairs: {}", desktop.overlapping_pairs());
-
-    // 클릭하면 그 창에 포커스가 간다
-    if let Some(window) = desktop.window_at(10, 10) {
-        let id = window.id;
-        println!("click (10, 10) hits #{id} {:?}", window.title);
-        desktop.focus(id);
+    for line in std::io::stdin().lines() {
+        let line = line.expect("stdin is readable");
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(command) = parse_command(line) else {
+            println!("? {line:?} (type help)");
+            continue;
+        };
+        match command {
+            Command::Open(title) => {
+                let id = desktop.open(&title);
+                println!("opened #{id}");
+            }
+            Command::Close(id) => {
+                if !desktop.close(id) {
+                    println!("no window #{id}");
+                }
+            }
+            Command::Focus(id) => {
+                if !desktop.focus(id) {
+                    println!("no window #{id}");
+                }
+            }
+            Command::Next => desktop.focus_next(),
+            Command::Click { x, y } => match desktop.window_at(x, y) {
+                Some(window) => {
+                    let id = window.id;
+                    desktop.focus(id);
+                    println!("focused #{id}");
+                }
+                None => println!("nothing at ({x}, {y})"),
+            },
+            Command::List => desktop.print(),
+            Command::Help => println!("{HELP}"),
+            Command::Quit => break,
+        }
+        if let Some(window) = desktop.focused_window() {
+            println!("[focus: #{} {}]", window.id, window.title);
+        }
     }
-    match desktop.window_at(5000, 10) {
-        Some(window) => println!("click (5000, 10) hits #{}", window.id),
-        None => println!("click (5000, 10) hits nothing"),
-    }
-
-    desktop.focus_next();
-    let title = desktop
-        .focused_window()
-        .map(|w| w.title.as_str())
-        .unwrap_or("(none)");
-    println!("after focus_next: {title}");
-
-    println!("close #{terminal}: {}", desktop.close(terminal));
-    println!("close #{terminal} again: {}", desktop.close(terminal));
-    desktop.print();
-    println!("overlapping pairs: {}", desktop.overlapping_pairs());
-
-    desktop.close(browser);
-    desktop.close(editor);
-    let title = desktop
-        .focused_window()
-        .map(|w| w.title.as_str())
-        .unwrap_or("(none)");
-    println!("after closing everything, focused: {title}");
-
-    // 나누어떨어지지 않을 때: 1000을 세 칸으로
-    let widths: Vec<u32> = tile(Rect::new(0, 0, 1000, 100), 3)
-        .iter()
-        .map(|r| r.width)
-        .collect();
-    println!("1000 into 3 columns: {widths:?}");
 }
