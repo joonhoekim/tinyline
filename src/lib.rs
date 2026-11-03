@@ -6,3 +6,4 @@ pub mod protocol;
 pub mod render;
 pub mod server;
 pub mod wire;
+pub mod xdg;

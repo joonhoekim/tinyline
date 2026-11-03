@@ -149,6 +149,17 @@ impl Desktop {
         true
     }
 
+    /// 창 제목을 바꾼다. 그런 창이 없으면 false.
+    pub fn set_title(&mut self, id: u32, title: &str) -> bool {
+        match self.windows.iter_mut().find(|w| w.id == id) {
+            Some(window) => {
+                window.title = title.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// id에 해당하는 창에 포커스를 준다. 그런 창이 없으면 false.
     pub fn focus(&mut self, id: u32) -> bool {
         if self.index_of(id).is_none() {

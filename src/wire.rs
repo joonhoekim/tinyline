@@ -112,6 +112,17 @@ impl MessageBuilder {
         self
     }
 
+    /// 배열: 길이(바이트 수) → 바이트 → 4의 배수가 되도록 0으로 채움.
+    pub fn array(mut self, value: &[u8]) -> MessageBuilder {
+        let length = u32::try_from(value.len()).expect("array length fits in u32");
+        self = self.uint(length);
+        self.args.extend_from_slice(value);
+        while !self.args.len().is_multiple_of(4) {
+            self.args.push(0);
+        }
+        self
+    }
+
     pub fn finish(self) -> Vec<u8> {
         let size = HEADER_SIZE + self.args.len();
         let size = u32::try_from(size).expect("message size fits in u32");

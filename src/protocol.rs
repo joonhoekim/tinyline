@@ -10,6 +10,7 @@ use memmap2::{Mmap, MmapOptions};
 
 use crate::layout::{Desktop, Rect};
 use crate::wire::{Args, Header, MessageBuilder, WireError, split_message};
+use crate::xdg::{Toplevel, XdgSurface};
 
 /// 클라이언트가 만든 객체 하나의 종류.
 ///
@@ -26,6 +27,10 @@ pub enum Object {
     Buffer,
     Surface,
     Region,
+    WmBase,
+    Positioner,
+    XdgSurface,
+    Toplevel,
 }
 
 impl Object {
@@ -40,6 +45,10 @@ impl Object {
             Object::Buffer => "wl_buffer",
             Object::Surface => "wl_surface",
             Object::Region => "wl_region",
+            Object::WmBase => "xdg_wm_base",
+            Object::Positioner => "xdg_positioner",
+            Object::XdgSurface => "xdg_surface",
+            Object::Toplevel => "xdg_toplevel",
         }
     }
 
@@ -66,6 +75,39 @@ impl Object {
                 "damage_buffer",
             ],
             Object::Region => &["destroy", "add", "subtract"],
+            Object::WmBase => &["destroy", "create_positioner", "get_xdg_surface", "pong"],
+            Object::Positioner => &[
+                "destroy",
+                "set_size",
+                "set_anchor_rect",
+                "set_anchor",
+                "set_gravity",
+                "set_constraint_adjustment",
+                "set_offset",
+            ],
+            Object::XdgSurface => &[
+                "destroy",
+                "get_toplevel",
+                "get_popup",
+                "set_window_geometry",
+                "ack_configure",
+            ],
+            Object::Toplevel => &[
+                "destroy",
+                "set_parent",
+                "set_title",
+                "set_app_id",
+                "show_window_menu",
+                "move",
+                "resize",
+                "set_max_size",
+                "set_min_size",
+                "set_maximized",
+                "unset_maximized",
+                "set_fullscreen",
+                "unset_fullscreen",
+                "set_minimized",
+            ],
         };
         names.get(usize::from(opcode)).copied().unwrap_or("?")
     }
@@ -82,6 +124,10 @@ impl Object {
             Object::Buffer => &["release"],
             Object::Surface => &["enter", "leave"],
             Object::Region => &[],
+            Object::WmBase => &["ping"],
+            Object::Positioner => &[],
+            Object::XdgSurface => &["configure"],
+            Object::Toplevel => &["configure", "close"],
         };
         names.get(usize::from(opcode)).copied().unwrap_or("?")
     }
@@ -103,6 +149,11 @@ pub const GLOBALS: &[Global] = &[
     Global {
         name: 2,
         interface: "wl_shm",
+        version: 1,
+    },
+    Global {
+        name: 3,
+        interface: "xdg_wm_base",
         version: 1,
     },
 ];
@@ -196,6 +247,8 @@ pub struct Surface {
     /// commit됐지만 아직 "그렸다"고 알리지 않은 frame 콜백들.
     pub frame_callbacks: Vec<u32>,
     pub commits: u32,
+    /// 이 표면에 붙은 xdg_surface. 이것이 있어야 창이 될 수 있다.
+    pub xdg_surface: Option<u32>,
 }
 
 /// 클라이언트가 말한 버퍼가 풀 안에 들어가는지 확인한다. 말이 안 되면 `None`.
@@ -322,7 +375,7 @@ impl Shared {
         }
     }
 
-    fn window_for(&self, client: u32, surface: u32) -> Option<u32> {
+    pub(crate) fn window_for(&self, client: u32, surface: u32) -> Option<u32> {
         self.windows
             .iter()
             .find(|(_, owner)| **owner == (client, surface))
@@ -330,7 +383,7 @@ impl Shared {
     }
 
     /// 표면에 창이 없으면 하나 연다.
-    fn show(&mut self, client: u32, surface: u32) {
+    pub(crate) fn show(&mut self, client: u32, surface: u32) {
         if self.window_for(client, surface).is_none() {
             let window = self
                 .desktop
@@ -340,7 +393,7 @@ impl Shared {
     }
 
     /// 표면의 창을 닫는다.
-    fn hide(&mut self, client: u32, surface: u32) {
+    pub(crate) fn hide(&mut self, client: u32, surface: u32) {
         if let Some(window) = self.window_for(client, surface) {
             self.desktop.close(window);
             self.windows.remove(&window);
@@ -380,6 +433,8 @@ pub struct Client {
     pub pools: HashMap<u32, Rc<Pool>>,
     pub buffers: HashMap<u32, Buffer>,
     pub surfaces: HashMap<u32, Surface>,
+    pub xdg_surfaces: HashMap<u32, XdgSurface>,
+    pub toplevels: HashMap<u32, Toplevel>,
     /// 켜 두면 주고받는 메시지를 한 줄씩 찍는다.
     pub log: bool,
 }
@@ -397,6 +452,8 @@ impl Client {
             pools: HashMap::new(),
             buffers: HashMap::new(),
             surfaces: HashMap::new(),
+            xdg_surfaces: HashMap::new(),
+            toplevels: HashMap::new(),
             log: false,
         }
     }
@@ -426,7 +483,7 @@ impl Client {
     }
 
     /// 새 객체를 표에 넣는다. 이미 있는 id면 에러.
-    fn create(&mut self, id: u32, object: Object) -> Result<(), ProtocolError> {
+    pub(crate) fn create(&mut self, id: u32, object: Object) -> Result<(), ProtocolError> {
         match self.objects.entry(id) {
             Entry::Occupied(_) => Err(ProtocolError::IdInUse(id)),
             Entry::Vacant(slot) => {
@@ -497,6 +554,7 @@ impl Client {
                 let object = match global.interface {
                     "wl_compositor" => Object::Compositor,
                     "wl_shm" => Object::Shm,
+                    "xdg_wm_base" => Object::WmBase,
                     _ => return Err(ProtocolError::UnknownGlobal(name)),
                 };
                 self.create(id, object)?;
@@ -590,6 +648,12 @@ impl Client {
             (Object::Surface, opcode) => {
                 self.handle_surface(header.object, opcode, args, shared)?;
             }
+            (
+                Object::WmBase | Object::Positioner | Object::XdgSurface | Object::Toplevel,
+                opcode,
+            ) => {
+                self.handle_xdg(object, header.object, opcode, args, shared)?;
+            }
             _ => {
                 return Err(ProtocolError::InvalidMethod {
                     object: header.object,
@@ -639,14 +703,25 @@ impl Client {
             // set_opaque_region, set_input_region, set_buffer_transform, set_buffer_scale: 무시한다
             4 | 5 | 7 | 8 => {}
             // commit: 모아 둔 변경을 한꺼번에 적용한다
-            6 => self.commit(id, shared),
+            6 => self.commit(id, shared)?,
             _ => return Err(ProtocolError::InvalidMethod { object: id, opcode }),
         }
         Ok(())
     }
 
-    fn commit(&mut self, id: u32, shared: &mut Shared) {
+    fn commit(&mut self, id: u32, shared: &mut Shared) -> Result<(), ProtocolError> {
         let surface = self.surfaces.get_mut(&id).expect("surface exists");
+        // 창이 되려는 표면은, 크기를 받아(configure) 확인(ack)하기 전에 버퍼를 붙일 수 없다.
+        if let Some(xdg_id) = surface.xdg_surface
+            && matches!(surface.pending.buffer, Some(Some(_)))
+            && !self.xdg_surfaces[&xdg_id].acked
+        {
+            return Err(ProtocolError::Object {
+                object: xdg_id,
+                code: 3, // xdg_surface.error.unconfigured_buffer
+                message: "buffer attached before acking the first configure".to_string(),
+            });
+        }
         let pending = std::mem::take(&mut surface.pending);
         let mut released = None;
         match pending.buffer {
@@ -661,11 +736,6 @@ impl Client {
         }
         surface.frame_callbacks.extend(pending.frame_callbacks);
         surface.commits += 1;
-        if surface.image.is_some() {
-            shared.show(self.id, id);
-        } else {
-            shared.hide(self.id, id);
-        }
         shared.dirty = true;
         if self.log {
             let size = surface
@@ -682,6 +752,7 @@ impl Client {
         if let Some(buffer_id) = released {
             self.send(MessageBuilder::new(buffer_id, 0).finish());
         }
+        Ok(())
     }
 
     /// 화면을 한 번 그렸다고 치고, 기다리던 frame 콜백에 모두 답한다.
@@ -697,7 +768,7 @@ impl Client {
     }
 
     /// 객체를 지우고, 클라이언트에게 그 id를 다시 써도 된다고 알린다(wl_display.delete_id).
-    fn destroy(&mut self, id: u32) {
+    pub(crate) fn destroy(&mut self, id: u32) {
         self.objects.remove(&id);
         self.send(MessageBuilder::new(1, 1).uint(id).finish());
     }

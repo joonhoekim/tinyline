@@ -195,6 +195,10 @@ pub fn run(socket: &Socket, output: Rect, frame_path: &Path) -> io::Result<()> {
         // 6. 바뀐 것이 있으면 다시 그리고, 그렸다고 클라이언트들에게 알린다.
         if shared.dirty {
             shared.dirty = false;
+            // 배치가 바뀌었을 수 있다. 창마다 새 크기와 포커스를 알린다.
+            for connection in &mut connections {
+                connection.client.configure_toplevels(&mut shared);
+            }
             let frame = composite(&shared, &connections);
             frame.save_ppm(frame_path)?;
             frames += 1;

@@ -4,19 +4,23 @@
 //! cargo run -- serve                                          # 터미널 1
 //! WAYLAND_DISPLAY=tinyline-0 cargo run --example paint        # 터미널 2
 //! WAYLAND_DISPLAY=tinyline-0 cargo run --example paint -- 5 2e8b57   # 5초 동안, 초록으로
+//!
+//! 지금 쓰는 데스크톱의 진짜 컴포지터에도 그대로 붙는다(`WAYLAND_DISPLAY`를 바꾸지 않으면).
 //! ```
 
 use std::io::{self, IoSlice, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
 use tinyline::wire::{Args, MessageBuilder, WireError, split_message};
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
+/// 컴포지터가 크기를 정해 주지 않을 때(0×0) 쓰는 크기.
+const DEFAULT_WIDTH: u32 = 320;
+const DEFAULT_HEIGHT: u32 = 240;
 
 /// 컴포지터와의 연결. 이벤트를 받아 그대로 쌓아 둔다.
 struct Connection {
@@ -65,44 +69,127 @@ impl Connection {
         Ok(())
     }
 
+    /// 소켓에서 한 번 읽어, 그 안의 완성된 이벤트를 모두 `on_event`에 넘긴다.
+    /// `timeout` 안에 아무것도 오지 않으면 `Ok(false)`.
+    fn read_events(
+        &mut self,
+        timeout: Option<Duration>,
+        on_event: &mut impl FnMut(u32, u16, Args<'_>),
+    ) -> io::Result<bool> {
+        self.stream.set_read_timeout(timeout)?;
+        let mut chunk = [0u8; 4096];
+        let count = match self.stream.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "compositor hung up",
+            ));
+        }
+        self.pending.extend_from_slice(&chunk[..count]);
+        let mut used = 0;
+        while let Some((header, body)) = split_message(&self.pending[used..]).map_err(wire)? {
+            used += usize::from(header.size);
+            if header.object == 1 && header.opcode == 0 {
+                let mut args = Args::new(body);
+                let (object, code) = (args.uint().map_err(wire)?, args.uint().map_err(wire)?);
+                let message = args.string().map_err(wire)?;
+                return Err(io::Error::other(format!(
+                    "protocol error on object {object} (code {code}): {message}"
+                )));
+            }
+            on_event(header.object, header.opcode, Args::new(body));
+        }
+        self.pending.drain(..used);
+        Ok(true)
+    }
+
     /// `wl_display.sync`를 보내고, 그 답이 올 때까지 이벤트를 받아 `on_event`에 넘긴다.
     /// sync의 답은 앞서 보낸 요청이 모두 처리된 뒤에 오므로, 왕복 한 번을 기다리는 셈이다.
     fn roundtrip(&mut self, mut on_event: impl FnMut(u32, u16, Args<'_>)) -> io::Result<()> {
         let callback = self.new_id();
         self.send(MessageBuilder::new(1, 0).uint(callback).finish())?;
-        let mut chunk = [0u8; 4096];
-        loop {
-            let count = self.stream.read(&mut chunk)?;
-            if count == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "compositor hung up",
-                ));
-            }
-            self.pending.extend_from_slice(&chunk[..count]);
-            let mut used = 0;
-            let mut done = false;
-            while let Some((header, body)) = split_message(&self.pending[used..]).map_err(wire)? {
-                used += usize::from(header.size);
-                if header.object == 1 && header.opcode == 0 {
-                    let mut args = Args::new(body);
-                    let (object, code) = (args.uint().map_err(wire)?, args.uint().map_err(wire)?);
-                    let message = args.string().map_err(wire)?;
-                    return Err(io::Error::other(format!(
-                        "protocol error on object {object} (code {code}): {message}"
-                    )));
-                }
-                if header.object == callback {
+        let mut done = false;
+        while !done {
+            self.read_events(None, &mut |object, opcode, args| {
+                if object == callback {
                     done = true;
                 } else {
-                    on_event(header.object, header.opcode, Args::new(body));
+                    on_event(object, opcode, args);
                 }
-            }
-            self.pending.drain(..used);
-            if done {
-                return Ok(());
+            })?;
+        }
+        Ok(())
+    }
+
+    /// 레지스트리에서 `interface`를 찾아 bind하고, 새 객체의 id를 돌려준다.
+    fn bind(
+        &mut self,
+        registry: u32,
+        globals: &[(u32, String, u32)],
+        interface: &str,
+        version: u32,
+    ) -> io::Result<u32> {
+        let (name, _, _) = globals
+            .iter()
+            .find(|(_, name, _)| name == interface)
+            .ok_or_else(|| io::Error::other(format!("compositor has no {interface}")))?;
+        let id = self.new_id();
+        self.send(
+            MessageBuilder::new(registry, 0)
+                .uint(*name)
+                .string(interface)
+                .uint(version)
+                .uint(id)
+                .finish(),
+        )?;
+        Ok(id)
+    }
+
+    /// 새 메모리 파일에 바둑판을 그려 버퍼 하나로 만든다.
+    fn draw(&mut self, shm: u32, width: u32, height: u32, color: u32) -> io::Result<u32> {
+        let stride = width * 4;
+        let size = stride * height;
+        let memfd = memfd_create("paint", MemfdFlags::CLOEXEC)?;
+        let mut file = std::fs::File::from(memfd);
+        let mut pixels = Vec::with_capacity(size as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.extend_from_slice(&checkerboard(x, y, color).to_le_bytes());
             }
         }
+        file.write_all(&pixels)?;
+
+        let pool = self.new_id();
+        let create_pool = MessageBuilder::new(shm, 0)
+            .uint(pool)
+            .int(size as i32)
+            .finish();
+        self.send_with_fd(create_pool, &file)?;
+        let buffer = self.new_id();
+        self.send(
+            MessageBuilder::new(pool, 0)
+                .uint(buffer)
+                .int(0)
+                .int(width as i32)
+                .int(height as i32)
+                .int(stride as i32)
+                .uint(1) // xrgb8888
+                .finish(),
+        )?;
+        // 풀은 버리고 버퍼만 남긴다. 버퍼가 있는 동안 메모리는 살아 있다.
+        self.send(MessageBuilder::new(pool, 1).finish())?;
+        Ok(buffer)
     }
 }
 
@@ -130,7 +217,7 @@ fn main() -> io::Result<()> {
 
     let mut conn = Connection::connect()?;
 
-    // 1. 어떤 전역 객체가 있는지 묻는다.
+    // 1. 어떤 전역 객체가 있는지 묻고, 필요한 셋에 붙는다.
     let registry = conn.new_id();
     conn.send(MessageBuilder::new(1, 1).uint(registry).finish())?;
     let mut globals: Vec<(u32, String, u32)> = Vec::new();
@@ -142,105 +229,86 @@ fn main() -> io::Result<()> {
             globals.push((name, interface, version));
         }
     })?;
-    println!("globals: {globals:?}");
+    let compositor = conn.bind(registry, &globals, "wl_compositor", 4)?;
+    let shm = conn.bind(registry, &globals, "wl_shm", 1)?;
+    let wm_base = conn.bind(registry, &globals, "xdg_wm_base", 1)?;
 
-    // 2. wl_shm에 붙는다.
-    let (shm_name, _, _) = globals
-        .iter()
-        .find(|(_, interface, _)| interface == "wl_shm")
-        .expect("compositor has wl_shm");
-    let shm = conn.new_id();
-    conn.send(
-        MessageBuilder::new(registry, 0)
-            .uint(*shm_name)
-            .string("wl_shm")
-            .uint(1)
-            .uint(shm)
-            .finish(),
-    )?;
-    let mut formats = Vec::new();
-    conn.roundtrip(|object, opcode, mut args| {
-        if object == shm && opcode == 0 {
-            formats.push(args.uint().expect("format"));
-        }
-    })?;
-    println!("wl_shm formats: {formats:?}");
-
-    // 3. 메모리 파일을 만들어 그림을 그린다.
-    let stride = WIDTH * 4;
-    let size = stride * HEIGHT;
-    let memfd = memfd_create("paint", MemfdFlags::CLOEXEC)?;
-    let mut file = std::fs::File::from(memfd);
-    let mut pixels = Vec::with_capacity(size as usize);
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            pixels.extend_from_slice(&checkerboard(x, y, color).to_le_bytes());
-        }
-    }
-    file.write_all(&pixels)?;
-
-    // 4. 그 파일의 fd를 소켓으로 넘겨 풀을 만들고, 풀 안에 버퍼를 하나 만든다.
-    let pool = conn.new_id();
-    let create_pool = MessageBuilder::new(shm, 0)
-        .uint(pool)
-        .int(size as i32)
-        .finish();
-    conn.send_with_fd(create_pool, &file)?;
-    let buffer = conn.new_id();
-    conn.send(
-        MessageBuilder::new(pool, 0)
-            .uint(buffer)
-            .int(0)
-            .int(WIDTH as i32)
-            .int(HEIGHT as i32)
-            .int(stride as i32)
-            .uint(1) // xrgb8888
-            .finish(),
-    )?;
-    println!("buffer#{buffer}: {WIDTH}x{HEIGHT} in pool#{pool}");
-
-    // 5. 표면을 만들고, 버퍼를 붙이고, 다 됐으면 알려 달라(frame)고 한 뒤 commit한다.
-    let (compositor_name, _, _) = globals
-        .iter()
-        .find(|(_, interface, _)| interface == "wl_compositor")
-        .expect("compositor has wl_compositor");
-    let compositor = conn.new_id();
-    conn.send(
-        MessageBuilder::new(registry, 0)
-            .uint(*compositor_name)
-            .string("wl_compositor")
-            .uint(4)
-            .uint(compositor)
-            .finish(),
-    )?;
+    // 2. 표면을 만들어 창(toplevel) 역할을 준다. 처음 commit은 그림 없이 한다:
+    //    "이런 창을 만들려 한다, 크기를 알려 달라".
     let surface = conn.new_id();
     conn.send(MessageBuilder::new(compositor, 0).uint(surface).finish())?;
+    let xdg_surface = conn.new_id();
     conn.send(
-        MessageBuilder::new(surface, 1)
-            .uint(buffer)
-            .int(0)
-            .int(0)
+        MessageBuilder::new(wm_base, 2)
+            .uint(xdg_surface)
+            .uint(surface)
             .finish(),
     )?;
+    let toplevel = conn.new_id();
+    conn.send(MessageBuilder::new(xdg_surface, 1).uint(toplevel).finish())?;
     conn.send(
-        MessageBuilder::new(surface, 2)
-            .int(0)
-            .int(0)
-            .int(WIDTH as i32)
-            .int(HEIGHT as i32)
+        MessageBuilder::new(toplevel, 2)
+            .string(&format!("paint {color:06x}"))
             .finish(),
     )?;
-    let frame = conn.new_id();
-    conn.send(MessageBuilder::new(surface, 3).uint(frame).finish())?;
     conn.send(MessageBuilder::new(surface, 6).finish())?;
-    conn.roundtrip(|object, opcode, mut args| {
-        if object == buffer && opcode == 0 {
-            println!("buffer#{buffer} released: we may draw into it again");
-        } else if object == frame && opcode == 0 {
-            println!("frame#{frame} done at {} ms", args.uint().expect("time"));
+
+    // 3. 컴포지터가 크기를 알려 줄 때마다(configure) 그 크기로 다시 그린다.
+    let deadline = Instant::now() + Duration::from_secs(seconds.max(1));
+    let mut size = (0, 0);
+    let mut configure_serial = None;
+    let mut ping = None;
+    let mut buffer: Option<u32> = None;
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        conn.read_events(Some(left), &mut |object, opcode, mut args| {
+            if object == toplevel && opcode == 0 {
+                let width = args.int().expect("width");
+                let height = args.int().expect("height");
+                size = (width, height);
+            } else if object == xdg_surface && opcode == 0 {
+                configure_serial = Some(args.uint().expect("serial"));
+            } else if object == wm_base && opcode == 0 {
+                ping = Some(args.uint().expect("serial"));
+            }
+        })?;
+        if let Some(serial) = ping.take() {
+            conn.send(MessageBuilder::new(wm_base, 3).uint(serial).finish())?;
         }
-    })?;
-    // 창이 화면에 남아 있게 잠시 연결을 붙들고 있는다.
-    std::thread::sleep(std::time::Duration::from_secs(seconds));
+        let Some(serial) = configure_serial.take() else {
+            continue;
+        };
+        // 0은 "네가 정해라"라는 뜻이다.
+        let width = u32::try_from(size.0)
+            .ok()
+            .filter(|w| *w > 0)
+            .unwrap_or(DEFAULT_WIDTH);
+        let height = u32::try_from(size.1)
+            .ok()
+            .filter(|h| *h > 0)
+            .unwrap_or(DEFAULT_HEIGHT);
+        println!("configure {serial}: {width}x{height}");
+        conn.send(MessageBuilder::new(xdg_surface, 4).uint(serial).finish())?;
+        let next = conn.draw(shm, width, height, color)?;
+        conn.send(
+            MessageBuilder::new(surface, 1)
+                .uint(next)
+                .int(0)
+                .int(0)
+                .finish(),
+        )?;
+        conn.send(
+            MessageBuilder::new(surface, 2)
+                .int(0)
+                .int(0)
+                .int(width as i32)
+                .int(height as i32)
+                .finish(),
+        )?;
+        conn.send(MessageBuilder::new(surface, 6).finish())?;
+        // 새 버퍼의 픽셀은 commit 때 컴포지터가 복사해 간다. 옛 버퍼는 버린다.
+        if let Some(old) = buffer.replace(next) {
+            conn.send(MessageBuilder::new(old, 0).finish())?;
+        }
+    }
     Ok(())
 }
