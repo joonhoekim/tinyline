@@ -54,6 +54,30 @@ struct Window {
     rect: Rect,
 }
 
+/// 길이 `total`을 `count`칸으로 나눴을 때 `index`번째 칸의 (시작 위치, 길이).
+///
+/// 나누어떨어지지 않으면 남는 길이를 앞쪽 칸부터 1씩 더 준다.
+/// 그래서 칸들을 모두 이으면 빈틈도 겹침도 없이 정확히 `total`이 된다.
+fn span(total: u32, count: u32, index: u32) -> (u32, u32) {
+    let base = total / count;
+    let extra = total % count;
+    let length = if index < extra { base + 1 } else { base };
+    let start = index * base + index.min(extra);
+    (start, length)
+}
+
+/// `area`를 세로 기둥 `count`개로 나눈다. 왼쪽 기둥부터 차례로 돌려준다.
+fn tile(area: Rect, count: usize) -> Vec<Rect> {
+    let count = u32::try_from(count).expect("window count fits in u32");
+    (0..count)
+        .map(|index| {
+            let (start, width) = span(area.width, count, index);
+            let x = area.x + i32::try_from(start).expect("offset fits in i32");
+            Rect::new(x, area.y, width, area.height)
+        })
+        .collect()
+}
+
 /// 화면 하나와 그 위의 창들.
 struct Desktop {
     output: Rect,
@@ -70,7 +94,7 @@ impl Desktop {
         }
     }
 
-    /// 새 창을 열고 그 id를 돌려준다. 새 창은 화면 전체를 차지한다.
+    /// 새 창을 열고 그 id를 돌려준다. 창을 열 때마다 화면을 다시 나눈다.
     fn open(&mut self, title: &str) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -79,6 +103,7 @@ impl Desktop {
             title: title.to_string(),
             rect: self.output,
         });
+        self.relayout();
         id
     }
 
@@ -86,7 +111,22 @@ impl Desktop {
     fn close(&mut self, id: u32) -> bool {
         let before = self.windows.len();
         self.windows.retain(|w| w.id != id);
-        self.windows.len() != before
+        let closed = self.windows.len() != before;
+        if closed {
+            self.relayout();
+        }
+        closed
+    }
+
+    /// 지금 열린 창들에 화면을 고르게 나눠 준다.
+    fn relayout(&mut self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        let rects = tile(self.output, self.windows.len());
+        for (window, rect) in self.windows.iter_mut().zip(rects) {
+            window.rect = rect;
+        }
     }
 
     /// 서로 겹치는 창의 쌍이 몇 개인지 센다.
@@ -136,4 +176,12 @@ fn main() {
     println!("close #{terminal}: {}", desktop.close(terminal));
     println!("close #{terminal} again: {}", desktop.close(terminal));
     desktop.print();
+    println!("overlapping pairs: {}", desktop.overlapping_pairs());
+
+    // 나누어떨어지지 않을 때: 1000을 세 칸으로
+    let widths: Vec<u32> = tile(Rect::new(0, 0, 1000, 100), 3)
+        .iter()
+        .map(|r| r.width)
+        .collect();
+    println!("1000 into 3 columns: {widths:?}");
 }
