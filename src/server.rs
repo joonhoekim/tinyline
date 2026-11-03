@@ -131,10 +131,14 @@ fn composite(shared: &Shared, connections: &[Connection]) -> Frame {
 }
 
 /// 소켓 하나와 연결된 클라이언트들을 돌보는 이벤트 루프. 돌아오지 않는다.
-pub fn run(socket: &Socket, output: Rect, frame_path: &Path) -> io::Result<()> {
+///
+/// `log`를 끄면 메시지마다 찍는 로그를 생략한다(진짜 클라이언트는 메시지를 아주 많이 보낸다).
+pub fn run(socket: &Socket, output: Rect, frame_path: &Path, log: bool) -> io::Result<()> {
     socket.listener.set_nonblocking(true)?;
     let mut shared = Shared::new(output);
     let mut frames = 0;
+    // 마지막으로 보여 준 창 목록(제목). 바뀌었을 때만 다시 찍는다.
+    let mut shown: Vec<String> = Vec::new();
     let mut connections: Vec<Connection> = Vec::new();
     let mut next_id = 1;
     let started = Instant::now();
@@ -160,7 +164,7 @@ pub fn run(socket: &Socket, output: Rect, frame_path: &Path) -> io::Result<()> {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(true)?;
                         let mut client = Client::new(next_id);
-                        client.log = true;
+                        client.log = log;
                         println!("[{next_id}] connected");
                         next_id += 1;
                         connections.push(Connection {
@@ -202,11 +206,23 @@ pub fn run(socket: &Socket, output: Rect, frame_path: &Path) -> io::Result<()> {
             let frame = composite(&shared, &connections);
             frame.save_ppm(frame_path)?;
             frames += 1;
-            println!(
-                "frame {frames}: {} window(s) -> {}",
-                shared.desktop.windows().len(),
-                frame_path.display()
-            );
+            if log {
+                println!(
+                    "frame {frames}: {} window(s) -> {}",
+                    shared.desktop.windows().len(),
+                    frame_path.display()
+                );
+            }
+            let titles: Vec<String> = shared
+                .desktop
+                .windows()
+                .iter()
+                .map(|window| window.title.clone())
+                .collect();
+            if titles != shown {
+                shared.desktop.print();
+                shown = titles;
+            }
             let time_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
             for connection in &mut connections {
                 connection.client.frame_done(time_ms);
